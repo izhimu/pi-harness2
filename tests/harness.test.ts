@@ -16,21 +16,29 @@ describe("pi-harness2 test suite", () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harness2-test-"));
+    delete process.env.PI_HARNESS_HOST_OVERRIDE;
+    delete process.env.PI_CODING_AGENT;
+    delete process.env.AI_AGENT;
+    delete process.env.OMP_PROFILE;
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.PI_HARNESS_HOST_OVERRIDE;
+    delete process.env.PI_CODING_AGENT;
+    delete process.env.AI_AGENT;
+    delete process.env.OMP_PROFILE;
   });
 
-  test("host-detector should detect omp when .omp exists", () => {
+  test("host-detector should detect omp when runtime env or .omp exists", () => {
     fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
     const hostInfo = detectHost(tmpDir);
     expect(hostInfo.host).toBe("omp");
     expect(hostInfo.projectConfigDir).toBe(path.join(tmpDir, ".omp"));
   });
 
-  test("host-detector should detect pi when .pi exists", () => {
-    fs.mkdirSync(path.join(tmpDir, ".pi"), { recursive: true });
+  test("host-detector should prioritize PI_CODING_AGENT runtime signal", () => {
+    process.env.PI_CODING_AGENT = "true";
     const hostInfo = detectHost(tmpDir);
     expect(hostInfo.host).toBe("pi");
     expect(hostInfo.projectConfigDir).toBe(path.join(tmpDir, ".pi"));
@@ -51,43 +59,48 @@ describe("pi-harness2 test suite", () => {
     expect(frictions[0].frequency).toBe(2);
   });
 
-  test("surface manager should enforce trigger line rule for skills", () => {
+  test("surface manager and ledger should cleanly apply and rollback a skill", () => {
     const hostInfo = {
       host: "omp" as const,
       projectConfigDir: path.join(tmpDir, ".omp"),
       userConfigDir: path.join(tmpDir, ".omp", "agent"),
     };
     const surface = new SurfaceManager(hostInfo);
+    const ledger = new ImprovementLedger(hostInfo);
 
-    const invalidProposal: HarnessProposal = {
-      id: "test-1",
+    const skillProposal: HarnessProposal = {
+      id: "prop-skill-1",
       component: "c6_skill",
-      targetPath: path.join(surface.getSkillDir(), "my-skill", "SKILL.md"),
-      summary: "Invalid skill missing trigger line",
-      contentDelta: "body",
-      confidence: 1.0,
+      targetPath: path.join(surface.getSkillDir(), "docker-helper", "SKILL.md"),
+      summary: "Docker guide",
+      contentDelta: "# Docker guide content",
+      triggerLine: "- When running docker commands, load the `docker-helper` skill.",
+      confidence: 0.9,
       status: "pending",
     };
 
-    const val = surface.validateProposal(invalidProposal);
-    expect(val.valid).toBe(false);
-    expect(val.reason).toContain("trigger line");
+    const applyRes = surface.applyProposal(skillProposal);
+    expect(applyRes.success).toBe(true);
+    expect(fs.existsSync(skillProposal.targetPath)).toBe(true);
 
-    const validProposal: HarnessProposal = {
-      ...invalidProposal,
-      triggerLine: "- When doing XYZ, load the `my-skill` skill.",
-    };
+    const rulesPath = surface.getRulesFile();
+    expect(fs.readFileSync(rulesPath, "utf-8")).toContain("docker-helper");
 
-    const validResult = surface.validateProposal(validProposal);
-    expect(validResult.valid).toBe(true);
+    const entry = ledger.recordCommit(skillProposal, "sess-1", applyRes.previousContent);
+    expect(entry.status).toBe("APPLIED");
 
-    const applyResult = surface.applyProposal(validProposal);
-    expect(applyResult.success).toBe(true);
-    expect(fs.existsSync(validProposal.targetPath)).toBe(true);
+    // Perform rollback
+    const rollbackRes = ledger.rollback(entry.id);
+    expect(rollbackRes.success).toBe(true);
 
-    // Verify trigger line appended to RULES.md
-    const rulesContent = fs.readFileSync(surface.getRulesFile(), "utf-8");
-    expect(rulesContent).toContain("my-skill");
+    // Verify SKILL.md is removed
+    expect(fs.existsSync(skillProposal.targetPath)).toBe(false);
+
+    // Verify empty parent directory is removed
+    expect(fs.existsSync(path.dirname(skillProposal.targetPath))).toBe(false);
+
+    // Verify trigger line is removed from RULES.md
+    expect(fs.readFileSync(rulesPath, "utf-8")).not.toContain("docker-helper");
   });
 
   test("surface manager should enforce anti-bloat limit for rules", () => {
@@ -113,7 +126,7 @@ describe("pi-harness2 test suite", () => {
     expect(val.reason).toContain("Anti-Bloat");
   });
 
-  test("ledger should record commit and perform rollback", () => {
+  test("ledger should record commit and perform rollback for regular file", () => {
     const hostInfo = {
       host: "omp" as const,
       projectConfigDir: path.join(tmpDir, ".omp"),

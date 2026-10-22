@@ -9,52 +9,43 @@ export interface HostInfo {
   userConfigDir: string;
 }
 
+function createHostInfo(host: HostType, cwd: string): HostInfo {
+  const dirName = host === "omp" ? ".omp" : ".pi";
+  return {
+    host,
+    projectConfigDir: path.join(cwd, dirName),
+    userConfigDir: path.join(os.homedir(), dirName, "agent"),
+  };
+}
+
 export function detectHost(cwd: string): HostInfo {
+  // 1. Explicit override
   const envOverride = process.env.PI_HARNESS_HOST_OVERRIDE;
   if (envOverride === "omp" || envOverride === "pi") {
-    const isOmp = envOverride === "omp";
-    const dirName = isOmp ? ".omp" : ".pi";
-    return {
-      host: envOverride,
-      projectConfigDir: path.join(cwd, dirName),
-      userConfigDir: path.join(os.homedir(), dirName, "agent"),
-    };
+    return createHostInfo(envOverride, cwd);
   }
 
-  // Check project-level directory
-  const hasOmpProject = fs.existsSync(path.join(cwd, ".omp"));
-  const hasPiProject = fs.existsSync(path.join(cwd, ".pi"));
-
-  if (hasOmpProject) {
-    return {
-      host: "omp",
-      projectConfigDir: path.join(cwd, ".omp"),
-      userConfigDir: path.join(os.homedir(), ".omp", "agent"),
-    };
+  // 2. Active runtime process signals
+  if (process.env.PI_CODING_AGENT === "true" || process.env.AI_AGENT === "pi") {
+    return createHostInfo("pi", cwd);
+  }
+  if (process.env.OMP_PROFILE !== undefined || process.argv.some((a) => a.includes("omp"))) {
+    return createHostInfo("omp", cwd);
   }
 
-  if (hasPiProject) {
-    return {
-      host: "pi",
-      projectConfigDir: path.join(cwd, ".pi"),
-      userConfigDir: path.join(os.homedir(), ".pi", "agent"),
-    };
+  // 3. Project-level directory probe
+  if (fs.existsSync(path.join(cwd, ".omp"))) {
+    return createHostInfo("omp", cwd);
+  }
+  if (fs.existsSync(path.join(cwd, ".pi"))) {
+    return createHostInfo("pi", cwd);
   }
 
-  // Check user-level directory
-  const hasOmpUser = fs.existsSync(path.join(os.homedir(), ".omp"));
-  if (hasOmpUser) {
-    return {
-      host: "omp",
-      projectConfigDir: path.join(cwd, ".omp"),
-      userConfigDir: path.join(os.homedir(), ".omp", "agent"),
-    };
+  // 4. User-level directory probe
+  if (fs.existsSync(path.join(os.homedir(), ".omp"))) {
+    return createHostInfo("omp", cwd);
   }
 
-  // Default to pi
-  return {
-    host: "pi",
-    projectConfigDir: path.join(cwd, ".pi"),
-    userConfigDir: path.join(os.homedir(), ".pi", "agent"),
-  };
+  // 5. Default fallback
+  return createHostInfo("pi", cwd);
 }

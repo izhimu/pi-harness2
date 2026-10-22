@@ -6,7 +6,7 @@ import type { HostInfo } from "./host-detector.js";
 export class ImprovementLedger {
   private ledgerPath: string;
 
-  constructor(hostInfo: HostInfo) {
+  constructor(private hostInfo: HostInfo) {
     this.ledgerPath = path.join(hostInfo.projectConfigDir, "harness", "ledger.json");
   }
 
@@ -68,8 +68,21 @@ export class ImprovementLedger {
         if (fs.existsSync(entry.filePath)) {
           fs.unlinkSync(entry.filePath);
         }
+
+        // Clean up empty skill directory if applicable
+        if (entry.component === "c6_skill") {
+          const skillDir = path.dirname(entry.filePath);
+          if (fs.existsSync(skillDir) && fs.readdirSync(skillDir).length === 0) {
+            fs.rmdirSync(skillDir);
+          }
+        }
       } else if (entry.action === "UPDATE" && entry.previousContent !== undefined) {
         fs.writeFileSync(entry.filePath, entry.previousContent, "utf-8");
+      }
+
+      // If c6_skill rollback, remove trigger line from RULES.md
+      if (entry.component === "c6_skill") {
+        this.cleanTriggerLineFromRules(entry.filePath);
       }
 
       entry.status = "REVERTED";
@@ -78,6 +91,24 @@ export class ImprovementLedger {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
+    }
+  }
+
+  private cleanTriggerLineFromRules(skillFilePath: string): void {
+    const skillName = path.basename(path.dirname(skillFilePath));
+    const rulesPath = path.join(this.hostInfo.projectConfigDir, "RULES.md");
+
+    if (!fs.existsSync(rulesPath)) return;
+
+    try {
+      const content = fs.readFileSync(rulesPath, "utf-8");
+      const lines = content.split("\n");
+      const targetPattern = `\`${skillName}\` skill`;
+      const filtered = lines.filter((line) => !line.includes(targetPattern));
+
+      fs.writeFileSync(rulesPath, filtered.join("\n").trimEnd() + "\n", "utf-8");
+    } catch {
+      // Best-effort cleanup
     }
   }
 

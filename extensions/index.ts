@@ -13,6 +13,10 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
   const pendingProposals = new Map<string, HarnessProposal>();
 
   pi.on("session_start", async (_event, ctx) => {
+    // Isolate session: clear previous session records and pending proposals
+    tracer.clear();
+    pendingProposals.clear();
+
     const hostInfo = detectHost(ctx.cwd);
     ctx.ui?.notify?.(
       `[pi-harness2] Active on ${hostInfo.host.toUpperCase()} (${hostInfo.projectConfigDir}) [Mode: ${currentMode}]`,
