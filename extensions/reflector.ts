@@ -1,9 +1,18 @@
 import * as path from "node:path";
 import type { FrictionPoint, HarnessProposal } from "./types.js";
 import type { HostInfo } from "./host-detector.js";
+import { SurfaceManager } from "./surface.js";
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
 
 export class ExperienceReflector {
-  constructor(private hostInfo: HostInfo) {}
+  private surface: SurfaceManager;
+
+  constructor(private hostInfo: HostInfo) {
+    this.surface = new SurfaceManager(hostInfo);
+  }
 
   public diagnoseAndPropose(frictions: FrictionPoint[]): HarnessProposal[] {
     const proposals: HarnessProposal[] = [];
@@ -14,8 +23,10 @@ export class ExperienceReflector {
         // Prioritize c6 Skill per Harness² ladder:
         // Always-on text is expensive, on-demand skill is preferred.
         const skillName = `${tool}-best-practices`;
-        const targetPath = path.join(this.hostInfo.projectConfigDir, "skills", skillName, "SKILL.md");
+        const targetPath = path.join(this.surface.getSkillDir(), skillName, "SKILL.md");
         const triggerLine = `- When encountering complex or repeated operations with \`${tool}\`, load the \`${skillName}\` skill.`;
+
+        const cleanErrors = friction.sampleErrors.map((e) => `> ${stripAnsi(e).replace(/\n/g, " ")}`);
 
         const contentDelta = [
           `---`,
@@ -27,7 +38,7 @@ export class ExperienceReflector {
           ``,
           `## Problem Context`,
           `Diagnosed from ${friction.frequency} failure(s) in session:`,
-          ...friction.sampleErrors.map((e) => `> ${e.replace(/\n/g, " ")}`),
+          ...cleanErrors,
           ``,
           `## Recommended Procedure`,
           `1. Verify command syntax, paths, and tool constraints prior to execution.`,
@@ -47,7 +58,7 @@ export class ExperienceReflector {
         });
       } else {
         // General rule proposal (bounded by <= 15 lines)
-        const targetPath = path.join(this.hostInfo.projectConfigDir, "RULES.md");
+        const targetPath = this.surface.getRulesFile();
         const contentDelta = `- Rule: Avoid repeated unverified assumptions when executing tasks. Double-check prerequisites.\n`;
 
         proposals.push({

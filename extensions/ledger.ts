@@ -2,12 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { LedgerEntry, HarnessProposal } from "./types.js";
 import type { HostInfo } from "./host-detector.js";
+import { SurfaceManager } from "./surface.js";
 
 export class ImprovementLedger {
   private ledgerPath: string;
+  private surface: SurfaceManager;
 
   constructor(private hostInfo: HostInfo) {
     this.ledgerPath = path.join(hostInfo.projectConfigDir, "harness", "ledger.json");
+    this.surface = new SurfaceManager(hostInfo);
   }
 
   public getLedgerPath(): string {
@@ -80,7 +83,7 @@ export class ImprovementLedger {
         fs.writeFileSync(entry.filePath, entry.previousContent, "utf-8");
       }
 
-      // If c6_skill rollback, remove trigger line from RULES.md
+      // If c6_skill rollback, remove trigger line from rules file
       if (entry.component === "c6_skill") {
         this.cleanTriggerLineFromRules(entry.filePath);
       }
@@ -96,7 +99,7 @@ export class ImprovementLedger {
 
   private cleanTriggerLineFromRules(skillFilePath: string): void {
     const skillName = path.basename(path.dirname(skillFilePath));
-    const rulesPath = path.join(this.hostInfo.projectConfigDir, "RULES.md");
+    const rulesPath = this.surface.getRulesFile();
 
     if (!fs.existsSync(rulesPath)) return;
 

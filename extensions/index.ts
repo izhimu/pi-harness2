@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, AutocompleteItem } from "@earendil-works/pi-coding-agent";
 import { detectHost } from "./host-detector.js";
 import { SessionTracer } from "./tracer.js";
 import { SurfaceManager } from "./surface.js";
@@ -7,15 +7,37 @@ import { ExperienceReflector } from "./reflector.js";
 import { HarnessReporter } from "./reporter.js";
 import type { HarnessProposal, HarnessReportData } from "./types.js";
 
+function isTextContent(item: unknown): item is { type: "text"; text: string } {
+  if (!item || typeof item !== "object") return false;
+  if (!("type" in item) || !("text" in item)) return false;
+  const typeVal = item.type;
+  const textVal = item.text;
+  return typeVal === "text" && typeof textVal === "string";
+}
+
+function extractOutputPreview(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content.trim() || undefined;
+  }
+  if (Array.isArray(content)) {
+    const textParts = content.filter(isTextContent).map((c) => c.text);
+    const combined = textParts.join("\n").trim();
+    return combined.length > 0 ? combined : undefined;
+  }
+  return undefined;
+}
+
 export default function piHarness2Extension(pi: ExtensionAPI) {
   const tracer = new SessionTracer();
   let currentMode: "auto" | "review" = "review";
   const pendingProposals = new Map<string, HarnessProposal>();
+  const toolCallStartTimes = new Map<string, number>();
 
   pi.on("session_start", async (_event, ctx) => {
     // Isolate session: clear previous session records and pending proposals
     tracer.clear();
     pendingProposals.clear();
+    toolCallStartTimes.clear();
 
     const hostInfo = detectHost(ctx.cwd);
     ctx.ui?.notify?.(
@@ -24,13 +46,25 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
     );
   });
 
+  pi.on("tool_call", async (event) => {
+    if (event.toolCallId) {
+      toolCallStartTimes.set(event.toolCallId, Date.now());
+    }
+  });
+
   pi.on("tool_result", async (event) => {
+    const startTime = event.toolCallId ? toolCallStartTimes.get(event.toolCallId) : undefined;
+    if (event.toolCallId) {
+      toolCallStartTimes.delete(event.toolCallId);
+    }
+    const durationMs = startTime ? Math.max(0, Date.now() - startTime) : 0;
+
     tracer.record({
       toolName: event.toolName,
       input: event.input,
-      outputPreview: typeof event.content === "string" ? event.content : undefined,
+      outputPreview: extractOutputPreview(event.content),
       isError: Boolean(event.isError),
-      durationMs: 0,
+      durationMs,
       timestamp: Date.now(),
     });
   });
@@ -74,7 +108,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
       const frictions = tracer.getFrictionPoints();
 
       if (frictions.length === 0 && pendingProposals.size === 0) {
-        ctx.ui?.notify?.("[pi-harness2] No friction or tool errors recorded in this session.", "info");
+        ctx.ui?.notify?.("[pi-harness2] No repeated friction or tool loops recorded in this session.", "info");
         return;
       }
 
@@ -101,6 +135,19 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
   pi.registerCommand("harness-apply", {
     description: "Apply a pending harness improvement proposal",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const lower = prefix.toLowerCase().trim();
+      const options: AutocompleteItem[] = [
+        { value: "all", label: "all", description: "Apply all pending proposals" },
+        ...Array.from(pendingProposals.values()).map((p) => ({
+          value: p.id,
+          label: p.id,
+          description: `[${p.component}] ${p.summary}`,
+        })),
+      ];
+      const matches = options.filter((o) => o.value.toLowerCase().startsWith(lower));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const id = args.trim();
       const hostInfo = detectHost(ctx.cwd);
@@ -192,6 +239,20 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
   pi.registerCommand("harness-rollback", {
     description: "Rollback an applied harness mutation by ID",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const hostInfo = detectHost(process.cwd());
+      const ledger = new ImprovementLedger(hostInfo);
+      const entries = ledger.getEntries().filter((e) => e.status === "APPLIED");
+      const lower = prefix.toLowerCase().trim();
+      const matches = entries
+        .filter((e) => e.id.toLowerCase().startsWith(lower))
+        .map((e) => ({
+          value: e.id,
+          label: e.id,
+          description: `[${e.component}] ${e.summary}`,
+        }));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const id = args.trim();
       if (!id) {
@@ -213,6 +274,15 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
   pi.registerCommand("harness-mode", {
     description: "Toggle between auto or review evolution mode",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const lower = prefix.toLowerCase().trim();
+      const modes: AutocompleteItem[] = [
+        { value: "auto", label: "auto", description: "Automatically apply proposals after session" },
+        { value: "review", label: "review", description: "Hold proposals for manual /harness-apply review" },
+      ];
+      const matches = modes.filter((m) => m.value.startsWith(lower));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const mode = args.trim().toLowerCase();
       if (mode === "auto" || mode === "review") {

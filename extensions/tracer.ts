@@ -1,5 +1,9 @@
 import type { ToolExecutionRecord, FrictionPoint } from "./types.js";
 
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
 export class SessionTracer {
   private records: ToolExecutionRecord[] = [];
   private maxRecords = 100;
@@ -8,7 +12,11 @@ export class SessionTracer {
     if (this.records.length >= this.maxRecords) {
       this.records.shift();
     }
-    this.records.push(record);
+    const cleanRecord = {
+      ...record,
+      outputPreview: record.outputPreview ? stripAnsi(record.outputPreview) : undefined,
+    };
+    this.records.push(cleanRecord);
   }
 
   public getRecords(): readonly ToolExecutionRecord[] {
@@ -36,6 +44,7 @@ export class SessionTracer {
     }
 
     for (const [tool, errors] of errorMap.entries()) {
+      // Harness² Rule: Minimum threshold of >= 2 errors to avoid false positives on transient exploration
       if (errors.length >= 2) {
         frictions.push({
           type: "tool_error_loop",
@@ -43,14 +52,6 @@ export class SessionTracer {
           description: `Tool "${tool}" failed ${errors.length} times in current session`,
           frequency: errors.length,
           sampleErrors: errors.slice(0, 3),
-        });
-      } else if (errors.length === 1) {
-        frictions.push({
-          type: "tool_error_loop",
-          toolName: tool,
-          description: `Tool "${tool}" encountered 1 failure`,
-          frequency: 1,
-          sampleErrors: errors,
         });
       }
     }

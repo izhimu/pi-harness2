@@ -18,7 +18,20 @@ declare module "@earendil-works/pi-coding-agent" {
     isIdle?(): boolean;
   }
 
+  export interface AutocompleteItem {
+    value: string;
+    label?: string;
+    description?: string;
+  }
+
+  export interface ToolCallEvent {
+    toolCallId: string;
+    toolName: string;
+    input: unknown;
+  }
+
   export interface ToolResultEvent {
+    toolCallId?: string;
     toolName: string;
     input: unknown;
     isError?: boolean;
@@ -29,6 +42,7 @@ declare module "@earendil-works/pi-coding-agent" {
   export interface ExtensionAPI {
     on(event: "session_start", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "session_stop", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_result", handler: (event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: string, handler: (...args: unknown[]) => unknown): void;
 
@@ -36,6 +50,7 @@ declare module "@earendil-works/pi-coding-agent" {
       name: string,
       def: {
         description: string;
+        getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
         handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
       },
     ): void;

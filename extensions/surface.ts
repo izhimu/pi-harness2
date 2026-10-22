@@ -26,7 +26,11 @@ export class SurfaceManager {
   }
 
   public getRulesFile(): string {
-    return path.join(this.getBaseDir(), "RULES.md");
+    if (this.hostInfo.host === "omp") {
+      return path.join(this.getBaseDir(), "RULES.md");
+    }
+    // For pi, workspace root AGENTS.md is the sticky rulebook
+    return path.join(path.dirname(this.getBaseDir()), "AGENTS.md");
   }
 
   public getSystemPromptFile(): string {
@@ -117,11 +121,22 @@ export class SurfaceManager {
       }
 
       let previousContent: string | undefined;
-      if (fs.existsSync(proposal.targetPath)) {
+      const fileExisted = fs.existsSync(proposal.targetPath);
+      if (fileExisted) {
         previousContent = fs.readFileSync(proposal.targetPath, "utf-8");
       }
 
-      fs.writeFileSync(proposal.targetPath, proposal.contentDelta, "utf-8");
+      // Safe merge for rules to prevent destroying existing project rules
+      if (proposal.component === "c2_rules" && fileExisted && previousContent !== undefined) {
+        if (!previousContent.includes(proposal.contentDelta.trim())) {
+          const merged = previousContent
+            ? `${previousContent.trimEnd()}\n${proposal.contentDelta.trim()}\n`
+            : `${proposal.contentDelta.trim()}\n`;
+          fs.writeFileSync(proposal.targetPath, merged, "utf-8");
+        }
+      } else {
+        fs.writeFileSync(proposal.targetPath, proposal.contentDelta, "utf-8");
+      }
 
       if (proposal.component === "c6_skill" && proposal.triggerLine) {
         this.appendTriggerLineToRules(proposal.triggerLine);
