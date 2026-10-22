@@ -19,10 +19,12 @@ export interface ToolExecutionRecord {
   timestamp: number;
 }
 
-export interface SessionFrictionPoint {
+export interface FrictionPoint {
   type: "tool_error_loop" | "repetitive_retries" | "context_spill" | "user_correction";
+  toolName?: string;
   description: string;
-  evidence: ToolExecutionRecord[];
+  frequency: number;
+  sampleErrors: string[];
 }
 
 export interface HarnessProposal {
@@ -52,16 +54,15 @@ export interface LedgerEntry {
 export interface HarnessReportData {
   host: HostType;
   baseDir: string;
-  totalSessions: number;
-  totalToolCalls: number;
+  totalCalls: number;
   totalErrors: number;
   errorRate: number;
   topFailingTools: Array<{ tool: string; count: number }>;
+  frictions: FrictionPoint[];
   activeComponents: {
     skillsCount: number;
     rulesCount: number;
     scriptsCount: number;
   };
-  recentProposals: HarnessProposal[];
   recentLedgerEntries: LedgerEntry[];
 }
