@@ -66,19 +66,19 @@
 
 ```
 pi-harness2/
-  ├── Tracer        # 轨迹收集器：捕获工具报错、重试风暴、纠偏信号
+  ├── SessionReader # 会话记录读取器：解析宿主自身 session JSONL 为时间线
   ├── Reflector     # 反思分析引擎：无监督诊断、失败归因、对比提议
   ├── SurfaceMgr    # 支架管理器：读写与校验 8 类组件，执行 Trigger 校验
   ├── Ledger        # 演进账本：记录 Commit 历史、元数据追踪、一键 Rollback
   └── Reporter      # 报告生成器：终端卡片交互与 Markdown 效能看板
 ```
 
-### 3.1 Tracer（轨迹收集器）
-- 拦截生命周期事件：
-  - `tool_call` & `tool_result`：记录工具名、参数、执行耗时、是否报错（`isError`）。
-  - `turn_end`：统计单轮 Token 消耗、标记用户否定词纠偏（如“不对”、“重新做”、“不要用...”）。
-  - `auto_retry_*`（omp 原生）/ 重复报错检测（Pi）：识别进入重试死循环。
-- 轨迹环形缓冲（Ring Buffer）：内存中仅保留最近活跃轮次的结构化数据，会话销毁时落盘临时日志。
+### 3.1 SessionReader（宿主会话记录读取）
+- **零重复记录铁律**：pi/omp 宿主已将全量会话（user/assistant/toolCall/toolResult，含 `isError`/`durationMs`）落盘于 `<userConfigDir>/sessions/<编码cwd>/<时间戳>_<sessionId>.jsonl`，Harness² 不再自行采集轨迹。
+- 会话结束（`session_stop`）或手动 `/harness-reflect` 时：
+  - 按记录头 `session.cwd` 精确匹配定位当前会话文件（pi 与 omp 目录编码规则不同，不反推路径编码）。
+  - 解析为 `TimelineEvent[]` + `ToolExecutionRecord[]`；超大文件仅读尾部 4MB（近期摩擦优先）。
+  - 派生摩擦点：同一工具 `isError ≥ 2` 判定为重试死循环。
 
 ### 3.2 Reflector（反思分析引擎）
 - **触发机制**：
@@ -138,7 +138,7 @@ pi-harness2/
 │   ├── index.ts             # 扩展入口（兼容 Pi 与 omp 注册逻辑）
 │   ├── types.ts             # 跨宿主类型定义
 │   ├── host-detector.ts     # 宿主探测与目录路由 (Pi vs omp)
-│   ├── tracer.ts            # 运行时事件拦截与轨迹采集
+│   ├── session-reader.ts    # 宿主会话记录解析与摩擦派生
 │   ├── reflector.ts         # 反思归因引擎
 │   ├── surface.ts           # 8 维组件管理与防膨胀约束
 │   ├── ledger.ts            # 账本持久化与回滚
@@ -155,7 +155,7 @@ pi-harness2/
 
 1. **第一阶段 (基础兼容与观测)**：
    - 验证 Pi 与 omp 双方的插件加载与命令注册。
-   - 实现 Tracer 拦截 `tool_result`，捕获异常与耗时。
+   - 实现 SessionReader 解析宿主会话记录，提取工具异常与耗时。
    - 实现 `/harness-report` 基础指标统计。
 2. **第二阶段 (反思与账本闭环)**：
    - 实现 Answer-Free Reflector，生成 Skill 与 Rule 改进提案。

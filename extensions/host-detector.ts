@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { HostType } from "./types.js";
+import type { HostType, HarnessPaths } from "./types.js";
 
 export interface HostInfo {
   host: HostType;
@@ -48,4 +48,13 @@ export function detectHost(cwd: string): HostInfo {
 
   // 5. Default fallback
   return createHostInfo("pi", cwd);
+}
+
+export function getHarnessPaths(hostInfo: HostInfo): HarnessPaths {
+  const harnessBase = path.join(hostInfo.projectConfigDir, "harness");
+  return {
+    harnessDir: harnessBase,
+    reportsDir: path.join(harnessBase, "reports"),
+    ledgerFile: path.join(harnessBase, "ledger.json"),
+  };
 }

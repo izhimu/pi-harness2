@@ -1,15 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { LedgerEntry, HarnessProposal } from "./types.js";
-import type { HostInfo } from "./host-detector.js";
+import { getHarnessPaths, type HostInfo } from "./host-detector.js";
 import { SurfaceManager } from "./surface.js";
 
 export class ImprovementLedger {
   private ledgerPath: string;
   private surface: SurfaceManager;
-
+  private commitSeq = 0;
   constructor(private hostInfo: HostInfo) {
-    this.ledgerPath = path.join(hostInfo.projectConfigDir, "harness", "ledger.json");
+    this.ledgerPath = getHarnessPaths(hostInfo).ledgerFile;
     this.surface = new SurfaceManager(hostInfo);
   }
 
@@ -37,7 +37,7 @@ export class ImprovementLedger {
     const entries = this.getEntries();
 
     const entry: LedgerEntry = {
-      id: `harn-${Date.now()}`,
+      id: `harn-${Date.now()}-${++this.commitSeq}-${Math.random().toString(36).slice(2, 6).padEnd(4, "0")}`,
       timestamp: Date.now(),
       sessionId,
       action: previousContent !== undefined ? "UPDATE" : "CREATE",

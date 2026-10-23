@@ -1,44 +1,103 @@
-import type { ExtensionAPI, AutocompleteItem } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  AutocompleteItem,
+  ExtensionContext,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { detectHost } from "./host-detector.js";
-import { SessionTracer } from "./tracer.js";
+import { readSession, deriveFrictionPoints, topFailingTools } from "./session-reader.js";
 import { SurfaceManager } from "./surface.js";
 import { ImprovementLedger } from "./ledger.js";
 import { ExperienceReflector } from "./reflector.js";
 import { HarnessReporter } from "./reporter.js";
 import type { HarnessProposal, HarnessReportData } from "./types.js";
 
-function isTextContent(item: unknown): item is { type: "text"; text: string } {
-  if (!item || typeof item !== "object") return false;
-  if (!("type" in item) || !("text" in item)) return false;
-  const typeVal = item.type;
-  const textVal = item.text;
-  return typeVal === "text" && typeof textVal === "string";
-}
-
-function extractOutputPreview(content: unknown): string | undefined {
-  if (typeof content === "string") {
-    return content.trim() || undefined;
-  }
-  if (Array.isArray(content)) {
-    const textParts = content.filter(isTextContent).map((c) => c.text);
-    const combined = textParts.join("\n").trim();
-    return combined.length > 0 ? combined : undefined;
-  }
-  return undefined;
-}
-
 export default function piHarness2Extension(pi: ExtensionAPI) {
-  const tracer = new SessionTracer();
   let currentMode: "auto" | "review" = "review";
+  let stopHandled = false;
+  let lastCwd: string | undefined;
   const pendingProposals = new Map<string, HarnessProposal>();
-  const toolCallStartTimes = new Map<string, number>();
+  const autoAppliedKeys = new Set<string>();
+
+  function addPendingProposals(proposals: HarnessProposal[]): number {
+    let added = 0;
+    for (const p of proposals) {
+      const key = `${p.component}:${p.targetPath}:${p.summary}`;
+      const alreadyPending = Array.from(pendingProposals.values()).some(
+        (q) => `${q.component}:${q.targetPath}:${q.summary}` === key,
+      );
+      if (!alreadyPending) {
+        pendingProposals.set(p.id, p);
+        added++;
+      }
+    }
+    return added;
+  }
+
+  async function reloadSession(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+    if (typeof ctx.reload !== "function") return;
+    try {
+      if ("waitForIdle" in ctx && typeof ctx.waitForIdle === "function") {
+        await ctx.waitForIdle();
+      }
+      await ctx.reload();
+    } catch {
+      ctx.ui?.notify?.("[pi-harness2] Applied, but session reload failed — new rules load next session.", "warning");
+    }
+  }
+
+  async function collectProposals(ctx: ExtensionContext): Promise<HarnessProposal[]> {
+    const hostInfo = detectHost(ctx.cwd);
+    const { timeline, records } = readSession(hostInfo, ctx.cwd);
+    const frictions = deriveFrictionPoints(records);
+    if (timeline.length === 0 && frictions.length === 0) return [];
+
+    const reflector = new ExperienceReflector(hostInfo);
+    const rawProposals =
+      timeline.length > 0
+        ? await reflector.diagnoseTimelineAsync(timeline)
+        : reflector.diagnoseAndPropose(frictions);
+    return rawProposals.filter((p) => !autoAppliedKeys.has(`${p.component}:${p.targetPath}:${p.summary}`));
+  }
+
+  async function autoEvolve(ctx: ExtensionContext): Promise<void> {
+    const proposals = await collectProposals(ctx);
+    if (proposals.length === 0) return;
+
+    const hostInfo = detectHost(ctx.cwd);
+    const surface = new SurfaceManager(hostInfo);
+    const ledger = new ImprovementLedger(hostInfo);
+    for (const p of proposals) {
+      const res = surface.applyProposal(p);
+      if (res.success) {
+        autoAppliedKeys.add(`${p.component}:${p.targetPath}:${p.summary}`);
+        if (res.unchanged) continue;
+        try {
+          ledger.recordCommit(p, "auto-session", res.previousContent);
+        } catch {
+          // Non-fatal if ledger write fails
+        }
+        ctx.ui?.notify?.(`[pi-harness2] Auto-evolved ${p.component}: ${p.summary}`, "info");
+      }
+    }
+  }
 
   pi.on("session_start", async (_event, ctx) => {
-    // Isolate session: clear previous session records and pending proposals
-    tracer.clear();
-    pendingProposals.clear();
-    toolCallStartTimes.clear();
-
+    stopHandled = false;
+    let normCwd: string;
+    try {
+      normCwd = fs.realpathSync(ctx.cwd);
+    } catch {
+      normCwd = path.resolve(ctx.cwd);
+    }
+    // Clear pending proposals if project/cwd changed to avoid cross-cwd leakage
+    if (lastCwd && lastCwd !== normCwd) {
+      pendingProposals.clear();
+      autoAppliedKeys.clear();
+    }
+    lastCwd = normCwd;
     const hostInfo = detectHost(ctx.cwd);
     ctx.ui?.notify?.(
       `[pi-harness2] Active on ${hostInfo.host.toUpperCase()} (${hostInfo.projectConfigDir}) [Mode: ${currentMode}]`,
@@ -46,78 +105,49 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
     );
   });
 
-  pi.on("tool_call", async (event) => {
-    if (event.toolCallId) {
-      toolCallStartTimes.set(event.toolCallId, Date.now());
-    }
-  });
-
-  pi.on("tool_result", async (event) => {
-    const startTime = event.toolCallId ? toolCallStartTimes.get(event.toolCallId) : undefined;
-    if (event.toolCallId) {
-      toolCallStartTimes.delete(event.toolCallId);
-    }
-    const durationMs = startTime ? Math.max(0, Date.now() - startTime) : 0;
-
-    tracer.record({
-      toolName: event.toolName,
-      input: event.input,
-      outputPreview: extractOutputPreview(event.content),
-      isError: Boolean(event.isError),
-      durationMs,
-      timestamp: Date.now(),
-    });
-  });
-
-  pi.on("session_stop", async (_event, ctx) => {
-    const frictions = tracer.getFrictionPoints();
-    if (frictions.length === 0) return;
-
-    const hostInfo = detectHost(ctx.cwd);
-    const reflector = new ExperienceReflector(hostInfo);
-    const proposals = reflector.diagnoseAndPropose(frictions);
-
-    if (proposals.length === 0) return;
-
-    if (currentMode === "auto") {
-      const surface = new SurfaceManager(hostInfo);
-      const ledger = new ImprovementLedger(hostInfo);
-
-      for (const p of proposals) {
-        const res = surface.applyProposal(p);
-        if (res.success) {
-          ledger.recordCommit(p, "auto-session", res.previousContent);
-          ctx.ui?.notify?.(`[pi-harness2] Auto-evolved ${p.component}: ${p.summary}`, "info");
-        }
+  // Diagnosis reads the host's own session recording (<userConfigDir>/sessions/...)
+  // at session end — no duplicate tracing on disk.
+  const handleSessionStop = async (_event: unknown, ctx: ExtensionContext) => {
+    if (stopHandled) return;
+    stopHandled = true;
+    try {
+      if (currentMode === "auto") {
+        // Session is ending: apply proposals for next session without reload
+        await autoEvolve(ctx);
+        return;
       }
-    } else {
-      for (const p of proposals) {
-        pendingProposals.set(p.id, p);
+
+      const proposals = await collectProposals(ctx);
+      if (proposals.length === 0) return;
+
+      const added = addPendingProposals(proposals);
+      if (added > 0) {
+        ctx.ui?.notify?.(
+          `[pi-harness2] ${pendingProposals.size} harness improvement proposals available. Run /harness-reflect to review.`,
+          "warning",
+        );
       }
-      ctx.ui?.notify?.(
-        `[pi-harness2] ${proposals.length} harness improvement proposals available. Run /harness-reflect to review.`,
-        "warning",
-      );
+    } catch {
+      // Session end diagnosis must never crash host
     }
+  };
+  pi.on("session_stop", handleSessionStop);
+  pi.on("session_shutdown", handleSessionStop);
+  pi.on("turn_start", () => {
+    stopHandled = false;
   });
 
   pi.registerCommand("harness-reflect", {
     description: "Review diagnostic proposals for session friction",
-    handler: async (args, ctx) => {
-      const hostInfo = detectHost(ctx.cwd);
-      const frictions = tracer.getFrictionPoints();
-
-      if (frictions.length === 0 && pendingProposals.size === 0) {
-        ctx.ui?.notify?.("[pi-harness2] No repeated friction or tool loops recorded in this session.", "info");
-        return;
+    handler: async (_args, ctx) => {
+      if (pendingProposals.size === 0) {
+        const proposals = await collectProposals(ctx);
+        addPendingProposals(proposals);
       }
 
       if (pendingProposals.size === 0) {
-        const reflector = new ExperienceReflector(hostInfo);
-        const proposals = reflector.diagnoseAndPropose(frictions);
-        for (const p of proposals) {
-          pendingProposals.set(p.id, p);
-        }
+        ctx.ui?.notify?.("[pi-harness2] No friction diagnosed in the current session recording.", "info");
+        return;
       }
 
       const list = Array.from(pendingProposals.values());
@@ -159,12 +189,22 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
         for (const [propId, p] of pendingProposals.entries()) {
           const res = surface.applyProposal(p);
           if (res.success) {
-            ledger.recordCommit(p, "manual-command", res.previousContent);
+            autoAppliedKeys.add(`${p.component}:${p.targetPath}:${p.summary}`);
+            if (!res.unchanged) {
+              try {
+                ledger.recordCommit(p, "manual-command", res.previousContent);
+              } catch {
+                // Non-fatal if ledger write fails
+              }
+              count++;
+            }
             pendingProposals.delete(propId);
-            count++;
           }
         }
         ctx.ui?.notify?.(`[pi-harness2] Applied ${count} proposals successfully.`, "info");
+        if (count > 0) {
+          await reloadSession(ctx);
+        }
         return;
       }
 
@@ -176,9 +216,18 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
       const res = surface.applyProposal(target);
       if (res.success) {
-        ledger.recordCommit(target, "manual-command", res.previousContent);
         pendingProposals.delete(id);
-        ctx.ui?.notify?.(`[pi-harness2] Applied ${target.component}: ${target.summary}`, "info");
+        autoAppliedKeys.add(`${target.component}:${target.targetPath}:${target.summary}`);
+        if (res.unchanged) {
+          ctx.ui?.notify?.(`[pi-harness2] ${target.component} already up to date: ${target.summary}`, "info");
+          return;
+        }
+        try {
+          ledger.recordCommit(target, "manual-command", res.previousContent);
+        } catch {
+          // Non-fatal if ledger write fails
+        }
+        await reloadSession(ctx);
       } else {
         ctx.ui?.notify?.(`[pi-harness2] Validation failed: ${res.error}`, "error");
       }
@@ -191,10 +240,10 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
       const hostInfo = detectHost(ctx.cwd);
       const surface = new SurfaceManager(hostInfo);
       const ledger = new ImprovementLedger(hostInfo);
+      const { records } = readSession(hostInfo, ctx.cwd);
 
-      const records = tracer.getRecords();
       const totalCalls = records.length;
-      const totalErrors = tracer.getErrors().length;
+      const totalErrors = records.filter((r) => r.isError).length;
       const errorRate = totalCalls > 0 ? (totalErrors / totalCalls) * 100 : 0;
 
       const reportData: HarnessReportData = {
@@ -203,8 +252,8 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
         totalCalls,
         totalErrors,
         errorRate,
-        topFailingTools: tracer.getTopFailingTools(),
-        frictions: tracer.getFrictionPoints(),
+        topFailingTools: topFailingTools(records),
+        frictions: deriveFrictionPoints(records),
         activeComponents: surface.countActiveComponents(),
         recentLedgerEntries: ledger.getEntries().slice(0, 5),
       };
@@ -266,6 +315,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
       if (res.success) {
         ctx.ui?.notify?.(`[pi-harness2] Rollback successful for commit ${id}.`, "info");
+        await reloadSession(ctx);
       } else {
         ctx.ui?.notify?.(`[pi-harness2] Rollback failed: ${res.error}`, "error");
       }

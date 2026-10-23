@@ -63,6 +63,46 @@ export interface HarnessReportData {
     skillsCount: number;
     rulesCount: number;
     scriptsCount: number;
+    memoryCount?: number;
   };
   recentLedgerEntries: LedgerEntry[];
 }
+
+export interface TimelineEvent {
+  timestamp: number;
+  type: "user_message" | "tool_call" | "tool_result" | "assistant_thought";
+  content: string;
+  toolName?: string;
+  toolCallId?: string;
+  isError?: boolean;
+  durationMs?: number;
+}
+
+export interface HarnessPaths {
+  harnessDir: string;
+  reportsDir: string;
+  ledgerFile: string;
+}
+
+export interface DiagnosticFriction {
+  category: "business_logic" | "domain_fact" | "tool_misuse" | "repetitive_flow";
+  userEvidence: string;
+  rootCause: string;
+}
+
+export interface DiagnosticProposal {
+  component: "c2_rules" | "c3_memory" | "c6_skill" | "c7_script";
+  summary: string;
+  targetFile?: string;
+  triggerLine?: string;
+  contentDelta: string;
+  confidence: number;
+  userEvidence?: string;
+}
+
+export interface DiagnosticResult {
+  frictions: DiagnosticFriction[];
+  proposals: DiagnosticProposal[];
+}
+
+export type LLMCompletionFn = (prompt: string) => Promise<string>;

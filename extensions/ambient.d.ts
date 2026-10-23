@@ -9,6 +9,7 @@ declare module "@earendil-works/pi-coding-agent" {
     ui?: ExtensionUIContext;
     hasUI?: boolean;
     waitForIdle?(): Promise<void>;
+    reload?(): Promise<void>;
   }
 
   export interface ExtensionContext {
@@ -16,6 +17,7 @@ declare module "@earendil-works/pi-coding-agent" {
     ui?: ExtensionUIContext;
     hasUI?: boolean;
     isIdle?(): boolean;
+    reload?(): Promise<void>;
   }
 
   export interface AutocompleteItem {
@@ -42,9 +44,13 @@ declare module "@earendil-works/pi-coding-agent" {
   export interface ExtensionAPI {
     on(event: "session_start", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "session_stop", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "turn_start", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "turn_end", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "input", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_result", handler: (event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | void): void;
-    on(event: string, handler: (...args: unknown[]) => unknown): void;
+    on(event: string, handler: (event?: any, ctx?: any, ...args: any[]) => any): void;
 
     registerCommand(
       name: string,
