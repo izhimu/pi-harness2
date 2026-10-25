@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import type { HarnessComponentType, HarnessProposal } from "./types.js";
 import type { HostInfo } from "./host-detector.js";
 
@@ -13,7 +15,140 @@ export interface ApplyResult {
   previousContent?: string;
   /** True when target already contains the mutation (idempotent no-op). */
   unchanged?: boolean;
+  /** c6 only: true when this apply added the skill's trigger line to the rules file. */
+  triggerAdded?: boolean;
   error?: string;
+}
+
+// Persistent rules and skill trigger lines are written inside a marked section of
+// the host's rules file. The anti-bloat line cap counts only this managed section,
+// so pre-existing user-authored content (e.g. a large AGENTS.md on pi) never blocks
+// evolution, and rollback of the whole file still restores the exact prior state.
+const RULES_SECTION_START = "<!-- pi-harness2:rules:start -->";
+const RULES_SECTION_END = "<!-- pi-harness2:rules:end -->";
+
+interface ManagedRules {
+  before: string;
+  lines: string[];
+  after: string;
+}
+
+function parseManagedRules(content: string): ManagedRules | null {
+  const startIdx = content.indexOf(RULES_SECTION_START);
+  const endIdx = content.indexOf(RULES_SECTION_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return null;
+  const inner = content.slice(startIdx + RULES_SECTION_START.length, endIdx);
+  return {
+    before: content.slice(0, startIdx),
+    lines: inner.split("\n").map((l) => l.trim()).filter((l) => l.length > 0),
+    after: content.slice(endIdx + RULES_SECTION_END.length),
+  };
+}
+
+function buildManagedRules(parsed: ManagedRules, extraLines: string[]): string {
+  const lines = [...parsed.lines, ...extraLines];
+  const section =
+    lines.length > 0
+      ? `${RULES_SECTION_START}\n${lines.join("\n")}\n${RULES_SECTION_END}\n`
+      : `${RULES_SECTION_START}\n${RULES_SECTION_END}\n`;
+  const head = parsed.before.length > 0 ? parsed.before.replace(/\n*$/, "\n\n") : "";
+  return head + section + parsed.after.replace(/^\n+/, "");
+}
+
+/** Append (or create) the managed section at the end of the file, then add lines. */
+function mergeIntoManagedSection(existing: string, newLines: string[]): string {
+  const parsed = parseManagedRules(existing);
+  if (parsed) {
+    const seen = new Set(parsed.lines);
+    const unseen = newLines.filter((l) => !seen.has(l));
+    if (unseen.length === 0) return existing;
+    return buildManagedRules(parsed, unseen);
+  }
+  const base = existing.trim().length > 0 ? `${existing.trimEnd()}\n\n` : "";
+  return base + buildManagedRules({ before: "", lines: [], after: "" }, newLines);
+}
+
+/** Lines currently inside the managed section (0 when the file has no section yet). */
+function managedRuleLineCount(content: string): number {
+  const parsed = parseManagedRules(content);
+  return parsed ? parsed.lines.length : 0;
+}
+
+/**
+ * Remove lines matching the predicate from inside the managed section, dropping the
+ * (now empty) section entirely when nothing remains.
+ */
+function removeFromManagedSection(existing: string, predicate: (line: string) => boolean): string {
+  const parsed = parseManagedRules(existing);
+  if (!parsed) return existing;
+  const kept = parsed.lines.filter((l) => !predicate(l));
+  if (kept.length === parsed.lines.length) return existing;
+  if (kept.length === 0) {
+    const before = parsed.before.replace(/\n*$/, "\n");
+    const after = parsed.after.replace(/^\n+/, "");
+    return (before.trimEnd() + "\n" + after).replace(/^\n+/, "");
+  }
+  return buildManagedRules({ ...parsed, lines: kept }, []);
+}
+
+/** Refuse to write through symlinks — a pre-planted link would escape the path fence. */
+function containsSymlink(target: string): boolean {
+  let current = path.resolve(target);
+  const root = path.parse(current).root;
+  for (let i = 0; i < 64 && current !== root; i++) {
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) return true;
+    } catch {
+      return false; // missing component: nothing to follow yet
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return false;
+}
+
+/** Best-effort syntax probe for generated scripts; missing interpreters pass. */
+function checkScriptSyntax(targetPath: string, content: string): ValidationResult {
+  const ext = path.extname(targetPath).toLowerCase();
+  try {
+    if (ext === ".sh" || ext === ".bash") {
+      execFileSync("bash", ["-n"], { input: content, timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
+    } else if (ext === ".py") {
+      execFileSync("python", ["-c", "import ast,sys; ast.parse(sys.stdin.read())"], {
+        input: content,
+        timeout: 5000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } else if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+      const tmp = path.join(os.tmpdir(), `pi-harness2-check-${Date.now()}${ext}`);
+      fs.writeFileSync(tmp, content, "utf-8");
+      try {
+        execFileSync("node", ["--check", tmp], { timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("ENOENT") || message.includes("not found") || message.includes("command not found")) {
+      return { valid: true }; // interpreter unavailable — skip the probe
+    }
+    const execErr = err as { stderr?: unknown; status?: unknown };
+    let stderrText = "";
+    if (typeof execErr.stderr === "string") {
+      stderrText = execErr.stderr;
+    } else if (Buffer.isBuffer(execErr.stderr)) {
+      stderrText = execErr.stderr.toString("utf-8");
+    }
+    const exitNote = typeof execErr.status === "number" ? ` (exit ${execErr.status})` : "";
+    const detail = stderrText.trim() ? stderrText.trim().slice(0, 200) : message.slice(0, 200);
+    return {
+      valid: false,
+      reason: `Harness² Rule: generated script failed syntax check${exitNote}: ${detail}`,
+    };
+  }
+  return { valid: true };
 }
 
 export class SurfaceManager {
@@ -47,6 +182,14 @@ export class SurfaceManager {
     return path.join(this.getBaseDir(), "memory");
   }
 
+  public getAgentsDir(): string {
+    return path.join(this.getBaseDir(), "agents");
+  }
+
+  public getExtensionsDir(): string {
+    return path.join(this.getBaseDir(), "extensions");
+  }
+
   public countActiveComponents(): { skillsCount: number; rulesCount: number; scriptsCount: number; memoryCount: number } {
     let skillsCount = 0;
     let rulesCount = 0;
@@ -66,8 +209,12 @@ export class SurfaceManager {
     const rulesFile = this.getRulesFile();
     if (fs.existsSync(rulesFile)) {
       try {
-        const lines = fs.readFileSync(rulesFile, "utf-8").split("\n").filter((l) => l.trim().length > 0);
-        rulesCount = lines.length;
+        const content = fs.readFileSync(rulesFile, "utf-8");
+        const managed = managedRuleLineCount(content);
+        rulesCount =
+          managed > 0
+            ? managed
+            : content.split("\n").filter((l) => l.trim().length > 0).length;
       } catch {
         rulesCount = 0;
       }
@@ -96,25 +243,54 @@ export class SurfaceManager {
     return { skillsCount, rulesCount, scriptsCount, memoryCount };
   }
 
-  public validateProposal(proposal: HarnessProposal): ValidationResult {
-    // P0 Security: targetPath must be strictly within configuration directories, or exact project rules/system file
-    const resolvedTarget = path.resolve(proposal.targetPath);
-    const allowedRoots = [
-      path.resolve(this.getBaseDir()),
-      path.resolve(this.hostInfo.userConfigDir),
-      path.resolve(this.hostInfo.projectConfigDir),
-    ];
-    const isAllowedSpecificFile =
-      resolvedTarget === path.resolve(this.getRulesFile()) ||
-      resolvedTarget === path.resolve(this.getSystemPromptFile());
+  /** Per-component allowed target locations — the security fence for applyProposal. */
+  private allowedTargetsFor(component: HarnessComponentType): Array<{ root: string; exactFile?: boolean }> {
+    const baseDir = path.resolve(this.getBaseDir());
+    switch (component) {
+      case "c1_prompt":
+        return [{ root: path.resolve(this.getSystemPromptFile()), exactFile: true }];
+      case "c2_rules":
+        return [{ root: path.resolve(this.getRulesFile()), exactFile: true }];
+      case "c3_memory":
+        return [
+          { root: path.resolve(this.getMemoryDir()) },
+          // Global memory is a recognized host location, but nothing else under userConfigDir
+          { root: path.resolve(path.join(this.hostInfo.userConfigDir, "memory")) },
+        ];
+      case "c5_subagent":
+        return [{ root: path.resolve(this.getAgentsDir()) }];
+      case "c6_skill":
+        return [{ root: path.resolve(this.getSkillDir()) }];
+      case "c7_script":
+        return [{ root: path.resolve(this.getScriptsDir()) }];
+      case "c8_plugin":
+        return [{ root: path.resolve(this.getExtensionsDir()) }];
+      default:
+        return [{ root: baseDir }];
+    }
+  }
 
-    const isContained =
-      isAllowedSpecificFile ||
-      allowedRoots.some((root) => resolvedTarget === root || resolvedTarget.startsWith(root + path.sep));
-    if (!isContained) {
+  public validateProposal(proposal: HarnessProposal): ValidationResult {
+    // P0 Security: targetPath must be inside this component's allowed locations
+    const resolvedTarget = path.resolve(proposal.targetPath);
+    const targets = this.allowedTargetsFor(proposal.component);
+    const isAllowed = targets.some((t) =>
+      t.exactFile
+        ? resolvedTarget === t.root
+        : resolvedTarget === t.root || resolvedTarget.startsWith(t.root + path.sep),
+    );
+    if (!isAllowed) {
+      const allowedDesc = targets.map((t) => (t.exactFile ? t.root : `${t.root}${path.sep}...`)).join(" or ");
       return {
         valid: false,
-        reason: `Security violation: targetPath ${proposal.targetPath} must be within extension configuration directory.`,
+        reason: `Security violation: targetPath ${proposal.targetPath} is outside the allowed location(s) for ${proposal.component}: ${allowedDesc}`,
+      };
+    }
+
+    if (containsSymlink(resolvedTarget)) {
+      return {
+        valid: false,
+        reason: `Security violation: targetPath ${proposal.targetPath} traverses a symlink; refusing to write outside the configuration tree.`,
       };
     }
 
@@ -132,17 +308,16 @@ export class SurfaceManager {
         };
       }
       // Pre-check trigger capacity: apply writes SKILL.md before appending the trigger,
-      // so a full RULES.md must fail here to avoid a dead skill file without registry entry
+      // so a full rules file must fail here to avoid a dead skill file without registry entry
       const rulesFile = this.getRulesFile();
       if (fs.existsSync(rulesFile)) {
         try {
           const existing = fs.readFileSync(rulesFile, "utf-8");
           if (!existing.includes(proposal.triggerLine.trim())) {
-            const lineCount = existing.split("\n").filter((l) => l.trim().length > 0).length;
-            if (lineCount >= 200) {
+            if (managedRuleLineCount(existing) >= 200) {
               return {
                 valid: false,
-                reason: "Harness² Rule: RULES.md at 200-line cap; c6 triggerLine would not be registered. Prune rules first.",
+                reason: "Harness² Rule: managed rules section at 200-line cap; c6 triggerLine would not be registered. Prune rules first.",
               };
             }
           }
@@ -168,10 +343,8 @@ export class SurfaceManager {
         if (fs.existsSync(rulesFile)) {
           try {
             const content = fs.readFileSync(rulesFile, "utf-8");
-            const existingLines = content
-              .split("\n")
-              .map((l) => l.trim())
-              .filter((l) => l.length > 0);
+            const parsed = parseManagedRules(content);
+            const existingLines = parsed ? parsed.lines : [];
             const existingLineSet = new Set(existingLines);
             const deltaLines = proposal.contentDelta
               .split("\n")
@@ -181,7 +354,7 @@ export class SurfaceManager {
             if (existingLines.length + unseenUnique.size > 200) {
               return {
                 valid: false,
-                reason: `Harness² Anti-Bloat Rule: Total rules in ${path.basename(rulesFile)} exceed limit (current: ${existingLines.length}, new: ${unseenUnique.size}, max: 200). Prune obsolete rules or decompose into a c6 Skill.`,
+                reason: `Harness² Anti-Bloat Rule: Managed rules would exceed the limit (current: ${existingLines.length}, new: ${unseenUnique.size}, max: 200). Prune obsolete rules or decompose into a c6 Skill.`,
               };
             }
           } catch {
@@ -197,6 +370,10 @@ export class SurfaceManager {
           reason: "Harness² Rule: Component contentDelta cannot be empty.",
         };
       }
+    }
+    if (proposal.component === "c7_script") {
+      const syntax = checkScriptSyntax(proposal.targetPath, proposal.contentDelta);
+      if (!syntax.valid) return syntax;
     }
 
     return { valid: true };
@@ -229,22 +406,21 @@ export class SurfaceManager {
         } else {
           fs.writeFileSync(proposal.targetPath, `${previousContent.trimEnd()}\n\n${proposal.contentDelta.trim()}\n`, "utf-8");
         }
-      } else if (proposal.component === "c2_rules" && fileExisted && previousContent !== undefined) {
-        // Line-oriented rules: merge only unseen lines
-        const existingLines = new Set(
-          previousContent
-            .split("\n")
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0),
-        );
-        const newLines = proposal.contentDelta
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
-        const unseenLines = [...new Set(newLines.filter((l) => !existingLines.has(l)))];
-
-        if (unseenLines.length > 0) {
-          const merged = `${(previousContent ?? "").trimEnd()}\n${unseenLines.join("\n")}\n`;
+      } else if (proposal.component === "c2_rules") {
+        // Line-oriented rules: merge only unseen lines into the managed section —
+        // including on first create, so the initial batch is sectioned, capped,
+        // and deduped exactly like every later merge
+        const newLines = [
+          ...new Set(
+            proposal.contentDelta
+              .split("\n")
+              .map((l) => l.trim())
+              .filter((l) => l.length > 0),
+          ),
+        ];
+        const base = previousContent ?? "";
+        const merged = newLines.length > 0 ? mergeIntoManagedSection(base, newLines) : base;
+        if (merged !== base) {
           fs.writeFileSync(proposal.targetPath, merged, "utf-8");
         } else {
           changed = false;
@@ -257,6 +433,7 @@ export class SurfaceManager {
         }
       }
 
+      let triggerAdded = false;
       if (proposal.component === "c6_skill" && proposal.triggerLine) {
         let triggerResult: "added" | "exists" | "capped";
         try {
@@ -264,48 +441,65 @@ export class SurfaceManager {
         } catch (err) {
           // Trigger registration failed after SKILL.md was written — roll the skill
           // file back so we don't leave an unreachable orphan on disk
-          if (fileExisted && previousContent !== undefined) {
-            fs.writeFileSync(proposal.targetPath, previousContent, "utf-8");
-          } else if (!fileExisted) {
-            fs.rmSync(proposal.targetPath, { force: true });
-            try {
-              fs.rmdirSync(path.dirname(proposal.targetPath));
-            } catch {
-              // ignore if non-empty
-            }
-          }
+          this.restoreSkillFile(proposal.targetPath, fileExisted, previousContent);
           throw err;
         }
         if (triggerResult === "capped") {
-          if (fileExisted && previousContent !== undefined) {
-            fs.writeFileSync(proposal.targetPath, previousContent, "utf-8");
-          } else if (!fileExisted) {
-            fs.rmSync(proposal.targetPath, { force: true });
-            try {
-              fs.rmdirSync(path.dirname(proposal.targetPath));
-            } catch {
-              // ignore if non-empty
-            }
-          }
+          this.restoreSkillFile(proposal.targetPath, fileExisted, previousContent);
           return {
             success: false,
-            error: "Rules file at 200-line cap; c6 triggerLine not registered. Prune rules first.",
+            error: "Rules file managed section at 200-line cap; c6 triggerLine not registered. Prune rules first.",
           };
         }
         if (triggerResult === "added") {
           changed = true;
+          triggerAdded = true;
         }
       }
 
-      return { success: true, previousContent, unchanged: !changed };
+      return { success: true, previousContent, unchanged: !changed, triggerAdded };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
     }
   }
 
+  private restoreSkillFile(targetPath: string, fileExisted: boolean, previousContent: string | undefined): void {
+    if (fileExisted && previousContent !== undefined) {
+      fs.writeFileSync(targetPath, previousContent, "utf-8");
+    } else if (!fileExisted) {
+      fs.rmSync(targetPath, { force: true });
+      try {
+        fs.rmdirSync(path.dirname(targetPath));
+      } catch {
+        // ignore if non-empty
+      }
+    }
+  }
+
+  /** Remove a skill's trigger registration from the managed rules section. */
+  public removeTriggerLineFromRules(skillName: string): void {
+    const rulesPath = this.getRulesFile();
+    if (!fs.existsSync(rulesPath)) return;
+    try {
+      const content = fs.readFileSync(rulesPath, "utf-8");
+      const targetPattern = `\`${skillName}\` skill`;
+      const updated = removeFromManagedSection(content, (line) => line.includes(targetPattern));
+      if (updated !== content) {
+        fs.writeFileSync(rulesPath, updated, "utf-8");
+      }
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+
   private appendTriggerLineToRules(triggerLine: string): "added" | "exists" | "capped" {
     const rulesPath = this.getRulesFile();
+    if (containsSymlink(rulesPath)) {
+      throw new Error(
+        `Security violation: rules file ${rulesPath} traverses a symlink; refusing to write the trigger line through it.`,
+      );
+    }
     const rulesDir = path.dirname(rulesPath);
     if (!fs.existsSync(rulesDir)) {
       fs.mkdirSync(rulesDir, { recursive: true });
@@ -317,14 +511,13 @@ export class SurfaceManager {
       if (existing.includes(triggerLine.trim())) {
         return "exists";
       }
-      const existingLineCount = existing.split("\n").filter((l) => l.trim().length > 0).length;
-      if (existingLineCount >= 200) {
+      if (managedRuleLineCount(existing) >= 200) {
         return "capped";
       }
     }
 
-    const updated = existing ? `${existing.trimEnd()}\n${triggerLine.trim()}\n` : `${triggerLine.trim()}\n`;
-    fs.writeFileSync(rulesPath, updated, "utf-8");
+    const merged = mergeIntoManagedSection(existing, [triggerLine.trim()]);
+    fs.writeFileSync(rulesPath, merged, "utf-8");
     return "added";
   }
 }

@@ -35,7 +35,11 @@ export interface HarnessProposal {
   triggerLine?: string; // required for c6 skills
   contentDelta: string;
   confidence: number;
-  status: "pending" | "applied" | "rejected" | "reverted";
+  /**
+   * False for proposals whose only evidence is a heuristic interpretation of user
+   * messages. Auto mode holds these for interactive review instead of applying them.
+   */
+  autoApplicable?: boolean;
 }
 
 export interface LedgerEntry {
@@ -49,6 +53,8 @@ export interface LedgerEntry {
   previousContent?: string;
   appliedContent: string;
   status: "APPLIED" | "REVERTED";
+  /** c6 only: true when this mutation added the skill's trigger line to the rules file. */
+  triggerAdded?: boolean;
 }
 
 export interface HarnessReportData {
@@ -82,6 +88,7 @@ export interface HarnessPaths {
   harnessDir: string;
   reportsDir: string;
   ledgerFile: string;
+  settingsFile: string;
 }
 
 export interface DiagnosticFriction {

@@ -1,6 +1,6 @@
 {
   "name": "@izhimu/pi-harness2",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Continuous self-improvement, recursive harness optimization, and reporting plugin for Pi and oh-my-pi (omp) based on Harness²",
   "type": "module",
   "main": "extensions/index.ts",
@@ -29,10 +29,14 @@
   "license": "Apache-2.0",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
       "optional": true
     },
     "@oh-my-pi/pi-coding-agent": {
@@ -40,6 +44,10 @@
     }
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@types/bun": "^1.4.4",
     "@types/node": "^22.13.0",
     "typescript": "^5.7.3"
   },

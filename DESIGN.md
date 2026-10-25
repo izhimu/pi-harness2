@@ -38,14 +38,17 @@
 - `package.json` 声明：
   - `pi.extensions`: `["./extensions"]`
   - `omp.extensions`: `["./extensions"]`
-  - `peerDependencies` 对 `@earendil-works/pi-coding-agent` 与 `@oh-my-pi/pi-coding-agent` 均设为 `optional`。
+  - `peerDependencies` 对 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-ai` 与 `@oh-my-pi/pi-coding-agent` 均设为 `optional`。
+  - `devDependencies` 固定真实 SDK 版本，`tsc --noEmit` 始终针对真实宿主 API 编译（不再维护手写 ambient 声明，杜绝 API 幻觉）。
 - 代码内部使用类型导入适配：优先通过宿主注入的 `ctx` 动态嗅探运行环境。
 
 ### 2.2 路径与配置目录自适应
-宿主探测规则：
-- 检查当前环境存在 `.omp` 或 `~/.omp` ──► 宿主为 `omp`，配置基准目录解析为 `.omp/`。
-- 否则检查 `.pi` 或 `~/.pi` ──► 宿主为 `pi`，配置基准目录解析为 `.pi/`。
-- 支持环境变量 `PI_HARNESS_HOST_OVERRIDE=pi|omp` 手动锁定。
+宿主探测规则（按优先级）：
+1. 环境变量 `PI_HARNESS_HOST_OVERRIDE=pi|omp` 手动锁定。
+2. 运行时进程信号：`PI_CODING_AGENT` / `AI_AGENT`（pi）、`OMP_PROFILE`（omp）、可执行文件名精确匹配 `omp`（argv 子串匹配会误伤 compose/example 等路径，已弃用）。
+3. 项目级目录探测：`.omp/` ──► omp；`.pi/` ──► pi。
+4. 用户级探测：仅存在 `~/.omp` ──► omp；`~/.omp` 与 `~/.pi` 并存时，按哪个宿主的 `sessions/` 目录（cwd 编码归一化匹配）实际存在当前项目的录制来消歧；无法判定则默认 pi。
+5. 兜底：pi。
 
 ### 2.3 8 大组件（c1..c8）在 Pi 与 omp 中的物理映射
 
@@ -75,23 +78,23 @@ pi-harness2/
 
 ### 3.1 SessionReader（宿主会话记录读取）
 - **零重复记录铁律**：pi/omp 宿主已将全量会话（user/assistant/toolCall/toolResult，含 `isError`/`durationMs`）落盘于 `<userConfigDir>/sessions/<编码cwd>/<时间戳>_<sessionId>.jsonl`，Harness² 不再自行采集轨迹。
-- 会话结束（`session_stop`）或手动 `/harness-reflect` 时：
-  - 按记录头 `session.cwd` 精确匹配定位当前会话文件（pi 与 omp 目录编码规则不同，不反推路径编码）。
-  - 解析为 `TimelineEvent[]` + `ToolExecutionRecord[]`；超大文件仅读尾部 4MB（近期摩擦优先）。
-  - 派生摩擦点：同一工具 `isError ≥ 2` 判定为重试死循环。
+- **增量累计解析**：会话文件为追加写，解析偏移按文件缓存——重复诊断只读新增字节，返回累计事件窗口（上限 4MB 最近内容）；文件缩短/替换时自动重置。每轮触发的读取成本从全量 4MB 降为 KB 级。
+- 触发时机（均为宿主真实事件）：
+  - `agent_settled`：每轮工作周期结束后做**确定性**诊断（review 模式在此提示用户，不调用 LLM）。
+  - `session_shutdown`：会话退出/重载/切换（auto 模式在此应用提案，可用 LLM）。
+  - 手动 `/harness-reflect`（可用 LLM）。
+- 按记录头 `session.cwd` 精确匹配定位当前会话文件（pi 与 omp 目录编码规则不同，不反推路径编码）；目录解析结果按 `(root, cwd)` 缓存，重复触发只列目标目录。
+- 派生摩擦点：同一工具 `isError ≥ 2` 判定为重试死循环，并附带平均耗时（≥5s 标注）。
 
 ### 3.2 Reflector（反思分析引擎）
 - **触发机制**：
-  - 自动触发：会话结束（`session_stop`），且当次会话存在摩擦事件（如错误数 $\ge 2$）。
+  - 自动触发：`agent_settled`（每轮周期结束）且当次会话存在摩擦事件（如错误数 $\ge 2$）。
   - 手动触发：运行 `/harness-reflect`。
-- **分析算法（Harness² Answer-Free 对比分析）**：
-  1. 摩擦点聚类：提取报错最多的工具与参数模式。
-  2. 决策树分流：
-     - 若为高频参数错误 ──► 优先生成 c8 中间件进行参数清洗或报错截断。
-     - 若为固定复杂多步流程 ──► 优先生成 c6 Skill 并注入单行触发词。
-     - 若为重复违规操作 ──► 提议 c2 Rule。
-     - 若为单纯大文本处理 ──► 提议 c7 Python/Node 确定性脚本。
-  3. 生成改进提案（`HarnessProposal`）。
+- **LLM 反思通道**：仅在显式触发点（`/harness-reflect`、auto 模式 `session_shutdown`）调用，复用宿主当前模型（`ctx.model` + `@earendil-works/pi-ai` 的 `completeSimple`，宿主进程内解析、密钥随宿主注入）；prompt 设预算（≤300 事件 / 48KB 字符，保留最近事件）；任何环节失败自动降级为确定性诊断。每轮 `agent_settled` 只做确定性诊断，不产生 token 成本。
+- **确定性诊断（降级路径）**：
+  1. 工具错误聚类（同一工具 ≥ 2 次）──► 生成 c6 Skill（错误摘要经消毒：仅首行、去 Markdown 语法、限长，防止提示注入持久化）。
+  2. 显式用户纠错（强信号正则，中英文）──► 提议 c2 Rule，标记 `autoApplicable=false`（auto 模式下仍需人工审查，避免规则污染）。
+- **LLM 路径（Answer-Free 对比分析）**：决策树分流后生成提案；c2/c3 提案必须通过逐提案 userEvidence grounding 校验，未通过即拒绝。
 
 ### 3.3 SurfaceMgr（支架管理器与防膨胀铁律）
 严格执行 Harness² 三大铁律：
@@ -99,8 +102,10 @@ pi-harness2/
    ```markdown
    - When <触发场景>, load the `<name>` skill.
    ```
-2. **Anti-Bloat 膨胀上限**：常驻提示词（c1/c2）更新严禁单次超过 15 行；总行数超标时必须淘汰陈旧规则。
-3. **确定性隔离**：外部代码生成必须放置在 `scripts/`，并进行语法与安全探测。
+   回滚时仅当该次变更真正新增了触发句（`triggerAdded`）或为 CREATE 时才移除注册，避免误删仍被引用的触发句。
+2. **Anti-Bloat 膨胀上限**：常驻提示词（c1/c2）更新严禁单次超过 15 行；规则写入宿主规则文件的**受管段落**（`<!-- pi-harness2:rules:start/end -->`），总行数上限 200 行仅统计受管段落——用户自有内容（如大型 AGENTS.md）不计入、不受影响。
+3. **确定性隔离**：外部代码生成必须放置在 `scripts/`，并进行语法探测（sh/bash `bash -n`、py `ast.parse`、js `node --check`；解释器缺失时跳过）。
+4. **安全围栏**：`targetPath` 按组件收窄到对应目录（c6 仅 skills/、c3 仅 memory/、c7 仅 scripts/……），拒绝穿越符号链接的写入（目标文件与规则文件均检查）。
 
 ### 3.4 Ledger（演进账本）
 - 持久化路径：`<baseDir>/harness/ledger.json`。
@@ -108,7 +113,10 @@ pi-harness2/
   - 变更前后 Diff
   - 动机与关联会话 ID
   - 影响组件类别与文件绝对路径
+  - c6 变更是否新增触发句（`triggerAdded`）
+- 读写经文件锁（`.lock` + 过期自愈）串行化，写入临时文件后原子重命名；条目经结构校验、上限 500 条。
 - 提供 `/harness-rollback <commit-id>`，实现文件原子性撤回。
+- 演进模式（auto/review）持久化于 `<baseDir>/harness/settings.json`，跨会话生效。
 
 ### 3.5 Reporter（分析与报告）
 - 命令 `/harness-report`：

@@ -2,6 +2,35 @@
 
 All notable changes to `@izhimu/pi-harness2` will be documented in this file.
 
+## [0.2.0] - 2026-10-25
+
+### Fixed
+- **Event wiring against the real host API** (`#P0`): the nonexistent `session_stop` event silently never fired. Review-mode diagnosis now runs on `agent_settled` (per agent cycle, while the user is still present) and auto-mode application on `session_shutdown`.
+- **Type safety against the real SDK**: removed the hand-written `ambient.d.ts`; `@earendil-works/pi-coding-agent`, `pi-ai`, and `pi-tui` are now devDependencies, so `tsc --noEmit` compiles against the actual host API. `tsconfig.json` now includes `tests/`.
+- **c6 skill UPDATE rollback no longer deletes still-needed trigger lines**: the ledger records `triggerAdded` per mutation; only the mutation that registered a trigger (or the skill's CREATE) removes it on rollback.
+- **`/harness-apply all` now reports rejected proposals** (with reasons) instead of silently dropping them.
+- **Dual-host detection on machines with both `~/.pi` and `~/.omp`**: disambiguates via the host whose session recordings actually cover the cwd (directory-name match confirmed by reading a session header, so punctuation-sibling paths cannot cross-match); argv matching is now exact-executable-name only.
+- **Large pre-existing AGENTS.md no longer blocks evolution**: rules and skill trigger lines are written into a managed `<!-- pi-harness2:rules:start/end -->` section (created on first write, so the initial batch is sectioned and idempotent); the 200-line anti-bloat cap counts only managed lines.
+- **Rules-file symlink protection**: the trigger-line registration path now refuses to write through a symlinked AGENTS.md/RULES.md, symmetric with the existing target-path check.
+
+### Added
+- **LLM reflection is now reachable in production — at explicit triggers only**: `/harness-reflect` and auto-mode session shutdown reuse the session's active model via `ctx.model` + `@earendil-works/pi-ai` `completeSimple` (in-process, host-managed credentials), under a strict prompt budget (≤ 300 events / 48 KB, most recent events kept). Per-cycle `agent_settled` diagnosis stays deterministic and free.
+- **Incremental cumulative session parsing**: session recordings are append-only, so re-diagnosis only parses newly appended bytes and returns the cumulative event window (bounded to the last 4 MB of parsed content; resets on file shrink/replacement). Per-cycle reads drop from a potential 4 MB scan to kilobytes.
+- **Evolution mode persistence** (`auto`/`review`) in `<baseDir>/harness/settings.json`, loaded at session start.
+- **Markdown report export**: `/harness-report` writes a dashboard to `<baseDir>/harness/reports/report-<timestamp>.md`.
+- **Script syntax probing** for generated c7 scripts (`bash -n`, `python ast.parse`, `node --check`; exit status and stderr detail surfaced; skipped when the interpreter is unavailable).
+- **Hardened apply path**: per-component path fencing (c6 only under `skills/`, c3 only under `memory/`, …), symlink traversal refusal, and ledger file locking with stale-lock recovery, entry validation, atomic writes, and a 500-entry cap.
+- **Injection-safe skill content**: tool-error snippets embedded in generated SKILL.md are reduced to a sanitized first line (no markdown/link/HTML syntax, capped length).
+- **Session-directory cache** for `findSessionFile` (repeat diagnoses no longer rescan every session directory).
+- **Held-proposal notifications in auto mode**: heuristic proposals held for review are announced instead of silently parked.
+
+### Changed
+- **User-correction detection tightened**: bare "should/must/not" no longer turn ordinary discussion into permanent rules; heuristic correction rules are marked non-auto-applicable and are held for review even in `auto` mode.
+- CJK-only skill names fall back to distinct stable slugs instead of collapsing onto `workflow`.
+- `durationMs` is now used: slow error loops (avg ≥ 5s) are annotated in friction descriptions.
+- `/harness-rollback` tab completion uses the tracked session cwd instead of `process.cwd()`.
+- README documents the `auto`-mode trust boundary: safeguards constrain where and what shape mutations take, but do not human-review LLM-derived content.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added

@@ -4,6 +4,68 @@ import type { LedgerEntry, HarnessProposal } from "./types.js";
 import { getHarnessPaths, type HostInfo } from "./host-detector.js";
 import { SurfaceManager } from "./surface.js";
 
+const MAX_LEDGER_ENTRIES = 500;
+
+function isValidEntry(e: unknown): e is LedgerEntry {
+  if (!e || typeof e !== "object") return false;
+  const o = e as Record<string, unknown>;
+  return (
+    typeof o.id === "string" &&
+    typeof o.timestamp === "number" &&
+    typeof o.component === "string" &&
+    typeof o.filePath === "string" &&
+    (o.status === "APPLIED" || o.status === "REVERTED") &&
+    (o.action === "CREATE" || o.action === "UPDATE" || o.action === "DELETE")
+  );
+}
+
+/**
+ * Cross-process read-modify-write guard: two hosts in the same project would
+ * otherwise clobber each other's ledger commits (last writer wins, entries lost).
+ */
+function withLedgerLock<T>(lockPath: string, fn: () => T): T {
+  const STALE_MS = 10_000;
+  const deadline = Date.now() + 2000;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  let fd: number | undefined;
+  for (;;) {
+    try {
+      fd = fs.openSync(lockPath, "wx");
+      break;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("ENOENT")) {
+        fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+        continue;
+      }
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        // lock vanished between open and stat — retry immediately
+      }
+      if (Date.now() > deadline) return fn(); // degrade to unlocked write rather than fail
+      const waitUntil = Date.now() + 50;
+      while (Date.now() < waitUntil) {
+        /* synchronous backoff */
+      }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      if (fd !== undefined) fs.closeSync(fd);
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      // best-effort release
+    }
+  }
+}
+
 export class ImprovementLedger {
   private ledgerPath: string;
   private surface: SurfaceManager;
@@ -24,18 +86,19 @@ export class ImprovementLedger {
     try {
       const data = fs.readFileSync(this.ledgerPath, "utf-8");
       const parsed = JSON.parse(data) as unknown;
-      if (Array.isArray(parsed)) {
-        return parsed as LedgerEntry[];
-      }
-      return [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(isValidEntry);
     } catch {
       return [];
     }
   }
 
-  public recordCommit(proposal: HarnessProposal, sessionId: string, previousContent?: string): LedgerEntry {
-    const entries = this.getEntries();
-
+  public recordCommit(
+    proposal: HarnessProposal,
+    sessionId: string,
+    previousContent?: string,
+    triggerAdded?: boolean,
+  ): LedgerEntry {
     const entry: LedgerEntry = {
       id: `harn-${Date.now()}-${++this.commitSeq}-${Math.random().toString(36).slice(2, 6).padEnd(4, "0")}`,
       timestamp: Date.now(),
@@ -47,72 +110,63 @@ export class ImprovementLedger {
       previousContent,
       appliedContent: proposal.contentDelta,
       status: "APPLIED",
+      triggerAdded,
     };
 
-    entries.unshift(entry);
-    this.saveEntries(entries);
+    withLedgerLock(`${this.ledgerPath}.lock`, () => {
+      const entries = this.getEntries();
+      entries.unshift(entry);
+      this.saveEntries(entries);
+    });
     return entry;
   }
 
   public rollback(id: string): { success: boolean; error?: string } {
-    const entries = this.getEntries();
-    const entry = entries.find((e) => e.id === id);
+    return withLedgerLock(`${this.ledgerPath}.lock`, () => {
+      const entries = this.getEntries();
+      const entry = entries.find((e) => e.id === id);
 
-    if (!entry) {
-      return { success: false, error: `Ledger entry ${id} not found.` };
-    }
+      if (!entry) {
+        return { success: false, error: `Ledger entry ${id} not found.` };
+      }
 
-    if (entry.status === "REVERTED") {
-      return { success: false, error: `Ledger entry ${id} is already reverted.` };
-    }
+      if (entry.status === "REVERTED") {
+        return { success: false, error: `Ledger entry ${id} is already reverted.` };
+      }
 
-    try {
-      if (entry.action === "CREATE") {
-        if (fs.existsSync(entry.filePath)) {
-          fs.unlinkSync(entry.filePath);
-        }
-
-        // Clean up empty skill directory if applicable
-        if (entry.component === "c6_skill") {
-          const skillDir = path.dirname(entry.filePath);
-          if (fs.existsSync(skillDir) && fs.readdirSync(skillDir).length === 0) {
-            fs.rmdirSync(skillDir);
+      try {
+        if (entry.action === "CREATE") {
+          if (fs.existsSync(entry.filePath)) {
+            fs.unlinkSync(entry.filePath);
           }
+
+          // Clean up empty skill directory if applicable
+          if (entry.component === "c6_skill") {
+            const skillDir = path.dirname(entry.filePath);
+            if (fs.existsSync(skillDir) && fs.readdirSync(skillDir).length === 0) {
+              fs.rmdirSync(skillDir);
+            }
+          }
+        } else if (entry.action === "UPDATE" && entry.previousContent !== undefined) {
+          fs.writeFileSync(entry.filePath, entry.previousContent, "utf-8");
         }
-      } else if (entry.action === "UPDATE" && entry.previousContent !== undefined) {
-        fs.writeFileSync(entry.filePath, entry.previousContent, "utf-8");
+
+        // Remove the trigger registration only when THIS mutation added it — the
+        // CREATE entry that registered an earlier skill's trigger stays untouched
+        // when rolling back a later content UPDATE.
+        if (entry.component === "c6_skill" && (entry.action === "CREATE" || entry.triggerAdded)) {
+          const skillName = path.basename(path.dirname(entry.filePath));
+          this.surface.removeTriggerLineFromRules(skillName);
+        }
+
+        entry.status = "REVERTED";
+        this.saveEntries(entries);
+        return { success: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { success: false, error: message };
       }
-
-      // If c6_skill rollback, remove trigger line from rules file
-      if (entry.component === "c6_skill") {
-        this.cleanTriggerLineFromRules(entry.filePath);
-      }
-
-      entry.status = "REVERTED";
-      this.saveEntries(entries);
-      return { success: true };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { success: false, error: message };
-    }
-  }
-
-  private cleanTriggerLineFromRules(skillFilePath: string): void {
-    const skillName = path.basename(path.dirname(skillFilePath));
-    const rulesPath = this.surface.getRulesFile();
-
-    if (!fs.existsSync(rulesPath)) return;
-
-    try {
-      const content = fs.readFileSync(rulesPath, "utf-8");
-      const lines = content.split("\n");
-      const targetPattern = `\`${skillName}\` skill`;
-      const filtered = lines.filter((line) => !line.includes(targetPattern));
-
-      fs.writeFileSync(rulesPath, filtered.join("\n").trimEnd() + "\n", "utf-8");
-    } catch {
-      // Best-effort cleanup
-    }
+    });
   }
 
   private saveEntries(entries: LedgerEntry[]): void {
@@ -120,6 +174,9 @@ export class ImprovementLedger {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(this.ledgerPath, JSON.stringify(entries, null, 2), "utf-8");
+    const capped = entries.slice(0, MAX_LEDGER_ENTRIES);
+    const tmp = `${this.ledgerPath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(capped, null, 2), "utf-8");
+    fs.renameSync(tmp, this.ledgerPath);
   }
 }

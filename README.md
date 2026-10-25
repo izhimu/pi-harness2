@@ -28,19 +28,22 @@ When an agent encounters friction — such as tool execution retry loops, syntax
 
 ## Features
 
-- 🔄 **Dual-Host Isomorphic Support**: Seamlessly detects and adapts to either `pi` (`.pi/` / `~/.pi/agent`) or `oh-my-pi` (`.omp/` / `~/.omp/agent`).
-- ⚡ **Zero-Overhead Session Ingestion**: Reads host native JSONL session records (`<userConfigDir>/sessions/...`) on session exit or command trigger — zero background logging daemons, zero duplicate telemetry I/O.
-- 🧠 **Answer-Free Contrastive Reflection**: Identifies friction hotspots (repeated tool failures, retry loops $\ge 2$, parameter hallucination) and derives grounded improvement proposals.
+- 🔄 **Dual-Host Isomorphic Support**: Seamlessly detects and adapts to either `pi` (`.pi/` / `~/.pi/agent`) or `oh-my-pi` (`.omp/` / `~/.omp/agent`), including correct disambiguation when both are installed on the same machine.
+- ⚡ **Zero-Overhead Session Ingestion**: Reads host native JSONL session records (`<userConfigDir>/sessions/...`) on each agent cycle or command trigger — zero background logging daemons, zero duplicate telemetry I/O. Session-directory resolution is cached per project.
+- 🧠 **LLM-Backed Reflection with Deterministic Fallback**: At explicit trigger points (`/harness-reflect` and auto-mode session shutdown) the session's active model (via the host's own `pi-ai` runtime) performs answer-free contrastive failure analysis with per-proposal evidence grounding, under a strict prompt budget (≤ 300 events / 48 KB). Per-cycle surfacing after each agent run is deterministic and free. Any model failure degrades gracefully to deterministic diagnosis.
 - 🛠️ **8-Component Self-Evolution (c1–c8)**: Full lifecycle management for System Prompts, Guardrails/Rules, Long-Term Memory, Tool Guidance, Subagents, Skills, Deterministic Scripts, and Middleware Plugins.
 - 🛡️ **Anti-Bloat & Trigger-Line Invariants**:
   - Enforces strict line boundaries on persistent prompts to protect the model's context budget.
-  - Automatically synthesizes and registers mandatory trigger lines when creating or updating skills.
+  - Rules are written into a managed section of the host rules file delimited by `<!-- pi-harness2:rules:start -->` and `<!-- pi-harness2:rules:end -->` — the 200-line cap counts only harness-managed lines, never your own AGENTS.md/RULES.md content.
+  - Automatically synthesizes and registers mandatory trigger lines when creating or updating skills; rollback only removes trigger lines that the rolled-back mutation actually added.
   - Verifies token grounding to eliminate hallucinated suggestions.
-- 📜 **Immutable Ledger & 1-Click Rollback**: Records full content diffs, session IDs, timestamps, and previous contents in `<baseDir>/harness/ledger.json`. Atomically revert any mutation with `/harness-rollback <id>`.
-- 📊 **Visual Analytics & Health Reports**: Rich ANSI terminal cards via `/harness-report` and exportable Markdown summaries tracking tool failure rates, friction points, and component metrics.
-- 🎛️ **Dual Evolution Modes**:
-  - `review` (default): Holds diagnosed proposals for interactive inspection and explicit approval via `/harness-apply`.
-  - `auto`: Automatically applies valid proposals at session shutdown for completely autonomous self-improvement.
+- 🔒 **Hardened Apply Path**: Per-component path fencing (skills only under `skills/`, scripts only under `scripts/`, …), symlink traversal refusal, and best-effort syntax checks (`bash -n`, `python ast`, `node --check`) for generated scripts.
+- 📜 **Immutable Ledger & 1-Click Rollback**: Records full content diffs, session IDs, timestamps, and previous contents in `<baseDir>/harness/ledger.json` (lock-guarded, entry-validated, size-capped). Atomically revert any mutation with `/harness-rollback <id>`.
+- 📊 **Visual Analytics & Health Reports**: Rich ANSI terminal cards via `/harness-report` plus an exportable Markdown dashboard written to `<baseDir>/harness/reports/`.
+- 🎛️ **Dual Evolution Modes** (persisted in `<baseDir>/harness/settings.json`):
+  - `review` (default): After each agent cycle, diagnosed proposals are held for interactive inspection and explicit approval via `/harness-apply`.
+  - `auto`: At session shutdown, automatically applies evidence-grounded proposals (recorded tool failures, LLM proposals that passed grounding). Heuristic user-correction rules are still held for review to protect your rulebook from noise.
+  - **Trust boundary**: `auto` mode applies LLM-derived content without human review. Safeguards (component path fencing, script syntax checks, evidence grounding, sanitized error snippets, immutable rollback ledger) constrain *where* and *what shape* mutations take, but they do not human-review the *content*. Prefer `review` mode in repositories whose tool outputs you do not trust.
 
 ---
 
@@ -132,24 +135,24 @@ All commands taking parameters (`/harness-apply`, `/harness-rollback`, `/harness
           │ Native session JSONL logging (<userConfigDir>/sessions/...)
           ▼
  ┌─────────────────┐
- │  SessionReader  │ (Zero-overhead: scans records on session_stop / /harness-reflect)
+ │  SessionReader  │ (Zero-overhead: scans records on agent_settled / /harness-reflect)
  └────────┬────────┘
           │ Tool failures, retry loops (count >= 2), syntax errors
           ▼
  ┌─────────────────┐
- │ Experience      │ (Answer-free contrastive reflection & grounding verification)
+ │ Experience      │ (Host-model reflection with grounding, or deterministic fallback)
  │ Reflector       │
  └────────┬────────┘
           │ Generates HarnessProposal across c1..c8
           ▼
  ┌─────────────────┐
- │ SurfaceManager  │ (Enforces anti-bloat limits & injects skill trigger lines)
+ │ SurfaceManager  │ (Component path fencing, anti-bloat limits, trigger-line injection)
  └────────┬────────┘
           │
      ┌────┴────────────────────────┐
      │ [review mode]               │ [auto mode]
      ▼                             ▼
- /harness-reflect            Auto-apply on session exit
+ /harness-reflect            Auto-apply at session_shutdown
  /harness-apply <id>               │
      │                             │
      └──────────────┬──────────────┘
@@ -169,10 +172,16 @@ All commands taking parameters (`/harness-apply`, `/harness-rollback`, `/harness
 
 Host detection order:
 1. `PI_HARNESS_HOST_OVERRIDE` environment variable (`pi` or `omp`).
-2. Active runtime process signals (`PI_CODING_AGENT`, `OMP_PROFILE`, `process.argv`).
+2. Active runtime process signals (`PI_CODING_AGENT` / `AI_AGENT` for pi, `OMP_PROFILE` or an `omp` executable name for omp).
 3. Project directory probe (`.omp/` then `.pi/`).
-4. User directory probe (`~/.omp/`).
-5. Fallback: `pi`.
+4. User directory probe: `~/.omp/` alone selects omp; when both `~/.omp/` and `~/.pi/` exist, the host that actually has session recordings for the current cwd wins; otherwise default to pi.
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `PI_HARNESS_HOST_OVERRIDE` | Force host detection to `pi` or `omp` |
+| `PI_HARNESS_SESSIONS_ROOT` | Override the session recordings root (used by tests) |
 
 ### Storage Paths
 
@@ -180,7 +189,9 @@ Host detection order:
 |------|-------------|--------------|
 | Ledger | `.pi/harness/ledger.json` | `.omp/harness/ledger.json` |
 | Reports | `.pi/harness/reports/` | `.omp/harness/reports/` |
-| Host Session Logs | `~/.pi/agent/sessions/<cwd-hash>/` | `~/.omp/agent/sessions/<cwd-hash>/` |
+| Settings (mode persistence) | `.pi/harness/settings.json` | `.omp/harness/settings.json` |
+| Managed rules section | `AGENTS.md` (between `<!-- pi-harness2:rules:start/end -->` markers) | `.omp/RULES.md` (between the same markers) |
+| Host Session Logs | `~/.pi/agent/sessions/<encoded-cwd>/` | `~/.omp/agent/sessions/<encoded-cwd>/` |
 
 ---
 
@@ -193,11 +204,10 @@ pi-harness2/
 │   ├── types.ts             # Host, component, proposal, ledger, and report types
 │   ├── host-detector.ts     # Pi vs. omp runtime and configuration path detection
 │   ├── session-reader.ts    # Host native JSONL parser and friction point extractor
-│   ├── reflector.ts         # Answer-free contrastive reflection & proposal generator
+│   ├── reflector.ts         # Host-model reflection & deterministic proposal generator
 │   ├── surface.ts           # 8-component surface manager & anti-bloat validation
 │   ├── ledger.ts            # Immutable mutation ledger and rollback manager
-│   ├── reporter.ts          # Terminal card and Markdown report formatter
-│   └── ambient.d.ts         # Ambient type declarations
+│   └── reporter.ts          # Terminal card and Markdown report formatter
 ├── tests/
 │   └── harness.test.ts      # Unit tests for reflection, ledger, surface, and reader
 ├── DESIGN.md                # Comprehensive technical specification & architecture
@@ -213,7 +223,11 @@ pi-harness2/
 ## Development & Testing
 
 ```bash
-# Run type check
+# Install dev dependencies (pins the real @earendil-works SDK so typecheck
+# validates against the actual host API — no hand-maintained ambient types)
+bun install
+
+# Run type check (covers extensions/ and tests/)
 bun run typecheck
 
 # Run test suite
