@@ -10,9 +10,17 @@ import { detectHost, getHarnessPaths } from "./host-detector.js";
 import { readSession, deriveFrictionPoints, topFailingTools } from "./session-reader.js";
 import { SurfaceManager } from "./surface.js";
 import { ImprovementLedger } from "./ledger.js";
-import { ExperienceReflector } from "./reflector.js";
+import { ExperienceReflector, isUserCorrection } from "./reflector.js";
+import { ExperienceLibrary } from "./experience.js";
 import { HarnessReporter } from "./reporter.js";
-import type { HarnessProposal, HarnessReportData, LLMCompletionFn } from "./types.js";
+import type {
+  HarnessProposal,
+  HarnessReportData,
+  LLMCompletionFn,
+  MutationOutcome,
+  TimelineEvent,
+  ToolExecutionRecord,
+} from "./types.js";
 
 type EvolutionMode = "auto" | "review";
 
@@ -122,23 +130,138 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
     const llmCaller = opts.allowLLM ? await createHostLLMCaller(ctx) : undefined;
     const reflector = new ExperienceReflector(hostInfo, llmCaller);
-    const proposals =
-      timeline.length > 0
-        ? await reflector.diagnoseTimelineAsync(timeline)
-        : reflector.diagnoseTimeline(
-            // Degenerate recordings (tool results only, no timeline): replay each
-            // friction at its recorded frequency so the >= 2 threshold still applies
-            frictions.flatMap((f) =>
-              Array.from({ length: Math.min(f.frequency, 5) }, () => ({
-                timestamp: Date.now(),
-                type: "tool_result" as const,
-                toolName: f.toolName ?? "unknown",
-                content: f.sampleErrors[0] ?? "Execution failed",
-                isError: true,
-              })),
-            ),
-          );
-    return proposals.filter((p) => !autoAppliedKeys.has(proposalKey(p)));
+
+    if (timeline.length > 0) {
+      // Harnessing-level recursion: earlier lessons inform the diagnosis, and new
+      // lessons distilled from this session persist for future ones
+      const library = new ExperienceLibrary(hostInfo);
+      const queryText = timeline
+        .map((e) => (e.type === "user_message" ? e.content : `${e.toolName ?? ""} ${e.content}`))
+        .join(" ")
+        .toLowerCase();
+      const result = await reflector.diagnoseTimelineAsync(timeline, {
+        priorLessons: library.relevant(queryText, 3),
+      });
+      for (const lesson of result.lessons) {
+        library.add(lesson);
+      }
+      return result.proposals.filter((p) => !autoAppliedKeys.has(proposalKey(p)));
+    }
+
+    // Degenerate recordings (tool results only, no timeline): replay each
+    // friction at its recorded frequency so the >= 2 threshold still applies
+    return reflector
+      .diagnoseTimeline(
+        frictions.flatMap((f) =>
+          Array.from({ length: Math.min(f.frequency, 5) }, () => ({
+            timestamp: Date.now(),
+            type: "tool_result" as const,
+            toolName: f.toolName ?? "unknown",
+            content: f.sampleErrors[0] ?? "Execution failed",
+            isError: true,
+          })),
+        ),
+      )
+      .filter((p) => !autoAppliedKeys.has(proposalKey(p)));
+  }
+
+  /**
+   * Measure how earlier mutations performed in this completed session — the
+   * plugin-context replacement for the paper's probe step: the next real session
+   * IS the probe. Only entries applied before this session are measured, and each
+   * session contributes at most one verdict per entry.
+   */
+  function updateOutcomes(
+    ledger: ImprovementLedger,
+    timeline: TimelineEvent[],
+    records: ToolExecutionRecord[],
+    sessionStart: number,
+  ): void {
+    if (timeline.length === 0) return;
+    const correctionRuleLines = new Set(
+      timeline
+        .filter((e) => e.type === "user_message" && isUserCorrection(e.content))
+        .map((e) => `- Rule: ${e.content.trim().replace(/\n+/g, " ").slice(0, 120)}`),
+    );
+
+    for (const entry of ledger.getEntries()) {
+      if (entry.status !== "APPLIED" || entry.timestamp >= sessionStart) continue;
+
+      if (entry.component === "c6_skill") {
+        const tool =
+          entry.evidence?.tool ?? path.basename(path.dirname(entry.filePath)).replace(/-best-practices$/, "");
+        const calls = records.filter((r) => r.toolName === tool).length;
+        if (calls === 0) continue; // tool untouched — no signal either way
+        const errs = records.filter((r) => r.toolName === tool && r.isError).length;
+        const baseline = entry.evidence?.baselineErrorCount ?? 2;
+        const status: MutationOutcome["status"] = errs < baseline ? "improved" : errs === baseline ? "neutral" : "regressed";
+        ledger.recordOutcome(entry.id, status, `tool ${tool}: baseline ${baseline} -> ${errs} error(s) across ${calls} call(s)`, sessionStart);
+      } else if (entry.component === "c2_rules") {
+        // The user restating an already-applied rule is a regression signal
+        if (correctionRuleLines.has(entry.appliedContent.trim())) {
+          ledger.recordOutcome(entry.id, "regressed", "rule re-stated by the user in a later session", sessionStart);
+        }
+      }
+    }
+  }
+
+  /** Entries with two consecutive regressions become rollback candidates. */
+  const ROLLBACK_CANDIDATE_REGRESSIONS = 2;
+  const MAX_AUTO_ROLLBACKS_PER_SHUTDOWN = 3;
+  let lastCandidateKey = "";
+
+  async function handleRollbackCandidates(
+    ctx: ExtensionContext,
+    ledger: ImprovementLedger,
+    shutdownReason?: string,
+  ): Promise<void> {
+    const candidates = ledger
+      .getEntries()
+      .filter(
+        (e) => e.status === "APPLIED" && (e.outcome?.consecutiveRegressed ?? 0) >= ROLLBACK_CANDIDATE_REGRESSIONS,
+      );
+    if (candidates.length === 0) return;
+
+    if (currentMode === "auto") {
+      let rolled = 0;
+      for (const entry of candidates.slice(0, MAX_AUTO_ROLLBACKS_PER_SHUTDOWN)) {
+        const res = ledger.rollback(entry.id);
+        if (res.success) {
+          rolled++;
+          ctx.ui.notify(`[pi-harness2] Auto-rolled back ineffective mutation ${entry.id}: ${entry.summary}`, "warning");
+        }
+      }
+      // Reloading is pointless when the host process is on its way out
+      if (rolled > 0 && shutdownReason !== "quit") {
+        await reloadSessionSafe(ctx);
+      }
+    } else {
+      // Surface each candidate SET exactly once — repeat shutdowns must not nag
+      const key = candidates
+        .map((e) => e.id)
+        .sort()
+        .join(",");
+      if (key === lastCandidateKey) return;
+      lastCandidateKey = key;
+      const list = candidates
+        .slice(0, 3)
+        .map((e) => `${e.id} (${e.outcome?.detail ?? "regressed"}) — ${e.summary}`)
+        .join("; ");
+      ctx.ui.notify(
+        `[pi-harness2] Rollback candidate(s) — mutations that measurably hurt: ${list}. Run /harness-rollback <id>.`,
+        "warning",
+      );
+    }
+  }
+
+  async function reloadSessionSafe(ctx: ExtensionContext): Promise<void> {
+    const cmdCtx = ctx as ExtensionCommandContext;
+    if (typeof cmdCtx.reload !== "function") return;
+    try {
+      await cmdCtx.reload();
+    } catch {
+      // reload is best-effort outside command handlers
+    }
   }
 
   async function autoEvolve(ctx: ExtensionContext): Promise<void> {
@@ -162,7 +285,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
         autoAppliedKeys.add(proposalKey(p));
         if (res.unchanged) continue;
         try {
-          ledger.recordCommit(p, "auto-session", res.previousContent, res.triggerAdded);
+          ledger.recordCommit(p, "auto-session", res.previousContent, res.triggerAdded, p.evidence);
         } catch {
           // Non-fatal if ledger write fails
         }
@@ -179,6 +302,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     cycleHandled = false;
+    lastCandidateKey = "";
     let normCwd: string;
     try {
       normCwd = fs.realpathSync(ctx.cwd);
@@ -226,10 +350,21 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
     cycleHandled = false;
   });
 
-  // Session is ending (quit / reload / switch): auto mode applies grounded
-  // proposals for the next session without reloading this one.
-  pi.on("session_shutdown", async (_event, ctx) => {
+  // Session is ending (quit / new / resume / fork): measure earlier mutations
+  // against this completed session (plugin-context probe), act on rollback
+  // candidates, then auto mode applies grounded proposals for the next session.
+  // reason "reload" means the session CONTINUES (extension hot reload) — nothing
+  // is final yet, so no measurement, no evolution, no rollbacks on that path.
+  pi.on("session_shutdown", async (event, ctx) => {
     try {
+      const reason = (event as { reason?: string } | undefined)?.reason;
+      if (reason === "reload") return;
+      const hostInfo = detectHost(ctx.cwd);
+      const ledger = new ImprovementLedger(hostInfo);
+      const { timeline, records } = readSession(hostInfo, ctx.cwd);
+      const sessionStart = timeline[0]?.timestamp ?? Date.now();
+      updateOutcomes(ledger, timeline, records, sessionStart);
+      await handleRollbackCandidates(ctx, ledger, reason);
       if (currentMode === "auto") {
         await autoEvolve(ctx);
       }
@@ -294,7 +429,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
             autoAppliedKeys.add(proposalKey(p));
             if (!res.unchanged) {
               try {
-                ledger.recordCommit(p, "manual-command", res.previousContent, res.triggerAdded);
+                ledger.recordCommit(p, "manual-command", res.previousContent, res.triggerAdded, p.evidence);
               } catch {
                 // Non-fatal if ledger write fails
               }
@@ -333,7 +468,7 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
           return;
         }
         try {
-          ledger.recordCommit(target, "manual-command", res.previousContent, res.triggerAdded);
+          ledger.recordCommit(target, "manual-command", res.previousContent, res.triggerAdded, target.evidence);
         } catch {
           // Non-fatal if ledger write fails
         }
@@ -352,6 +487,46 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
       const ledger = new ImprovementLedger(hostInfo);
       const { records } = readSession(hostInfo, ctx.cwd);
 
+      // Trigger audit (the autotrigger invariant): repair existing skills whose
+      // trigger line never made it into the rules file
+      let triggerAudit: { repaired: number; skipped: number } | undefined;
+      const missingTriggers = surface.listSkillsWithoutTrigger();
+      if (missingTriggers.length > 0) {
+        triggerAudit = { repaired: 0, skipped: 0 };
+        for (const m of missingTriggers) {
+          let content: string;
+          try {
+            content = fs.readFileSync(m.skillFile, "utf-8");
+          } catch {
+            triggerAudit.skipped++;
+            continue;
+          }
+          const auditProposal: HarnessProposal = {
+            id: `audit-${Date.now()}-${m.name}`,
+            component: "c6_skill",
+            targetPath: m.skillFile,
+            summary: `Register missing trigger for existing skill ${m.name}`,
+            contentDelta: content,
+            triggerLine: m.triggerLine,
+            confidence: 0.9,
+          };
+          const res = surface.applyProposal(auditProposal);
+          if (res.success && !res.unchanged) {
+            try {
+              ledger.recordCommit(auditProposal, "trigger-audit", res.previousContent, res.triggerAdded);
+            } catch {
+              // Non-fatal
+            }
+            triggerAudit.repaired++;
+          } else {
+            triggerAudit.skipped++;
+          }
+        }
+        if (triggerAudit.repaired > 0) {
+          ctx.ui.notify(`[pi-harness2] Trigger audit: registered ${triggerAudit.repaired} missing skill trigger line(s).`, "info");
+        }
+      }
+
       const totalCalls = records.length;
       const totalErrors = records.filter((r) => r.isError).length;
       const errorRate = totalCalls > 0 ? (totalErrors / totalCalls) * 100 : 0;
@@ -366,6 +541,9 @@ export default function piHarness2Extension(pi: ExtensionAPI) {
         frictions: deriveFrictionPoints(records),
         activeComponents: surface.countActiveComponents(),
         recentLedgerEntries: ledger.getEntries().slice(0, 5),
+        outcomeEntries: ledger.getEntries().filter((e) => e.outcome).slice(0, 5),
+        warnings: surface.surfaceHealthWarnings(),
+        triggerAudit,
       };
 
       ctx.ui.notify(HarnessReporter.renderTerminalReport(reportData), "info");

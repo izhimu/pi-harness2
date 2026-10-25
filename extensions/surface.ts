@@ -307,6 +307,23 @@ export class SurfaceManager {
           reason: "Harness² Rule 1: Trigger line must follow format: '- When <condition>, load the `<name>` skill.'",
         };
       }
+      // Frontmatter hygiene (mirrors host loader behavior): a missing description
+      // drops the skill SILENTLY at load, and a mismatched `name:` overrides the
+      // directory name so every trigger line naming the dir stops matching.
+      const fm = proposal.contentDelta.slice(0, 600);
+      if (!/^description:\s*\S/m.test(fm)) {
+        return {
+          valid: false,
+          reason: "Harness² Rule: SKILL.md needs a `description:` in its frontmatter — without it the host drops the skill SILENTLY at load.",
+        };
+      }
+      const nameMatch = /^name:\s*(\S+)\s*$/m.exec(fm);
+      if (nameMatch && nameMatch[1] !== path.basename(path.dirname(path.resolve(proposal.targetPath)))) {
+        return {
+          valid: false,
+          reason: `Harness² Rule: SKILL.md frontmatter \`name: ${nameMatch[1]}\` overrides the directory name at load, so trigger lines naming \`${path.basename(path.dirname(path.resolve(proposal.targetPath)))}\` stop matching. Drop the \`name:\` line or make it match.`,
+        };
+      }
       // Pre-check trigger capacity: apply writes SKILL.md before appending the trigger,
       // so a full rules file must fail here to avoid a dead skill file without registry entry
       const rulesFile = this.getRulesFile();
@@ -491,6 +508,92 @@ export class SurfaceManager {
     } catch {
       // Best-effort cleanup
     }
+  }
+
+  /**
+   * Audit existing skills whose trigger line is missing from the rules file (the
+   * plugin's translation of Harness² `autotrigger`): an untriggered skill is dead
+   * weight the agent never learns to invoke. Returns each skill with a trigger
+   * line synthesized from its SKILL.md description.
+   */
+  public listSkillsWithoutTrigger(): Array<{ name: string; skillFile: string; triggerLine: string }> {
+    const skillDir = this.getSkillDir();
+    if (!fs.existsSync(skillDir)) return [];
+    let rules = "";
+    const rulesPath = this.getRulesFile();
+    if (fs.existsSync(rulesPath)) {
+      try {
+        rules = fs.readFileSync(rulesPath, "utf-8");
+      } catch {
+        rules = "";
+      }
+    }
+    const out: Array<{ name: string; skillFile: string; triggerLine: string }> = [];
+    let dirs: fs.Dirent[];
+    try {
+      dirs = fs.readdirSync(skillDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const d of dirs) {
+      if (!d.isDirectory()) continue;
+      const skillFile = path.join(skillDir, d.name, "SKILL.md");
+      if (!fs.existsSync(skillFile)) continue;
+      if (rules.includes(`\`${d.name}\` skill`)) continue;
+      let desc = `working with ${d.name}`;
+      try {
+        const fm = fs.readFileSync(skillFile, "utf-8").slice(0, 600);
+        const m = /^description:\s*(.+)$/m.exec(fm);
+        if (m) desc = m[1]!.trim();
+      } catch {
+        // keep fallback description
+      }
+      const cleanDesc = desc.replace(/["`]/g, "").replace(/\.$/, "").slice(0, 80) || `working with ${d.name}`;
+      out.push({ name: d.name, skillFile, triggerLine: `- When ${cleanDesc}, load the \`${d.name}\` skill.` });
+    }
+    return out;
+  }
+
+  /** Soft-cap hygiene warnings surfaced by /harness-report. */
+  public surfaceHealthWarnings(): string[] {
+    const warnings: string[] = [];
+    const sys = this.getSystemPromptFile();
+    if (fs.existsSync(sys)) {
+      try {
+        const len = fs.readFileSync(sys, "utf-8").length;
+        if (len > 8_000) {
+          warnings.push(`SYSTEM.md is ${len.toLocaleString()} chars (soft cap 8,000) — every token competes with the agent's output budget; move content to skills.`);
+        }
+      } catch {
+        // unreadable — skip
+      }
+    }
+    const memDir = this.getMemoryDir();
+    if (fs.existsSync(memDir)) {
+      try {
+        let bytes = 0;
+        let files = 0;
+        for (const f of fs.readdirSync(memDir)) {
+          try {
+            const stat = fs.statSync(path.join(memDir, f));
+            if (stat.isFile()) {
+              bytes += stat.size;
+              files++;
+            }
+          } catch {
+            // skip unreadable entries
+          }
+        }
+        if (bytes > 512 * 1024) {
+          warnings.push(`memory/ holds ${(bytes / 1024).toFixed(0)} KB across ${files} files (soft cap 512 KB) — consolidate or prune stale facts.`);
+        } else if (files > 50) {
+          warnings.push(`memory/ holds ${files} files (soft cap 50) — consolidate or prune stale facts.`);
+        }
+      } catch {
+        // skip
+      }
+    }
+    return warnings;
   }
 
   private appendTriggerLineToRules(triggerLine: string): "added" | "exists" | "capped" {

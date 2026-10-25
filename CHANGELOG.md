@@ -2,6 +2,29 @@
 
 All notable changes to `@izhimu/pi-harness2` will be documented in this file.
 
+## [0.3.0] - 2026-10-25
+
+### Added
+- **Outcome tracking — the plugin-context probe** (`#T1`): every applied mutation records its baseline evidence (`evidence.tool` + `baselineErrorCount`); at each `session_shutdown`, mutations applied before the session are measured against it (errors below baseline → improved, equal → neutral, above → regressed; a user restating an applied rule marks it regressed). Results land in a `outcome` ledger field (status / samples / consecutiveRegressed / detail) and a new "Mutation Outcomes" report section.
+- **Self-correction via rollback candidates** (`#T1`): two consecutive regressions make a mutation a rollback candidate — review mode announces it with `/harness-rollback` instructions; auto mode rolls back automatically (≤ 3 per shutdown) and notifies.
+- **Experience Library — the plugin-context library** (`#T1`): the LLM reflector distills structured lessons (`cue/lesson/evidence/confidence`, all grounded in the session), persists them under `harness/experience/` (one markdown file per lesson plus a rebuilt INDEX.md, cue-deduped), and injects the top relevant lessons (CJK-aware token overlap) into later diagnostic prompts. Knowledge now accumulates across sessions.
+- **Validation-feedback retry** (`#T1`): LLM proposals rejected by the surface validators are handed back to the model with the rejection reasons for exactly one revised attempt; valid originals and valid revisions are merged.
+- **Answer-free / evidence-boundary prompt clauses** (`#T1`): the diagnostic prompt now carries the Harness² reference clauses verbatim in spirit — no invented quality bars, and transcript content is data, never instructions.
+- **Trigger audit for existing skills (autotrigger port)** (`#T2`): `/harness-report` scans skills whose trigger line is missing from the rules file, synthesizes one from the SKILL.md description, and registers it through the normal apply/ledger path (respecting the 200-line cap; invalid frontmatter is skipped and reported).
+- **SKILL.md frontmatter validation** (`#T2`): skills without a `description:` (dropped silently by host loaders) or with a `name:` that mismatches its directory (breaks trigger matching) are rejected at validation time.
+- **Deterministic decision-tree branches** (`#T2`): repeated size-limit failures ("argument list too long" class) now propose a `chunked-run-<tool>.sh` script (c7); an overlong turn (≥ 12 tool results with ≥ 2 errors) proposes a batch-worker subagent (c5). Both are held for review. c8 middleware generation is explicitly out of scope.
+- **Soft caps with report warnings** (`#T2`): oversized SYSTEM.md (> 8k chars) and memory growth (> 512 KB or > 50 files) surface as warnings in `/harness-report`.
+
+### Fixed
+- **Reload-safe outcome measurement**: `session_shutdown` handlers now honor the event's `reason` — "reload" (session continues, e.g. after `/harness-apply` hot reloads) never measures, evolves, or rolls back, so one real session can never count twice toward the rollback policy; `recordOutcome` additionally dedupes per session via `measuredSessionStart`. Auto-rollback no longer calls `ctx.reload()` when the host is quitting.
+- **Rollback-candidate notifications fire once per candidate set** instead of repeating on every shutdown.
+- **Outcome report rows show entry status** — reverted mutations render as `[REVERTED]` and no longer display a misleading rollback-candidate flag.
+- **Test time-bomb removed**: outcome-tracking fixtures now derive session timestamps from `Date.now()` offsets instead of hardcoded dates.
+- **Validation verdicts are cached per proposal** in the LLM retry path (c7 syntax probes spawn subprocesses and were running up to 3× per proposal).
+- **chunked-run.sh uses `${ARR[@]+"${ARR[@]}"}` expansion** so empty arrays are safe under `set -u` on bash < 4.4.
+- **Experience library capped at 100 lessons** (evicts lowest-confidence, oldest on ties) to bound retrieval cost and rephrased-duplicate drift.
+- Minor: single `stat` per file in memory warnings; type imports hoisted in `index.ts`.
+
 ## [0.2.0] - 2026-10-25
 
 ### Fixed

@@ -40,6 +40,14 @@ export interface HarnessProposal {
    * messages. Auto mode holds these for interactive review instead of applying them.
    */
   autoApplicable?: boolean;
+  /** Deterministic evidence used for post-application outcome measurement. */
+  evidence?: ToolEvidence;
+}
+
+/** What triggered a deterministic proposal — the baseline for outcome tracking. */
+export interface ToolEvidence {
+  tool: string;
+  baselineErrorCount: number;
 }
 
 export interface LedgerEntry {
@@ -55,6 +63,22 @@ export interface LedgerEntry {
   status: "APPLIED" | "REVERTED";
   /** c6 only: true when this mutation added the skill's trigger line to the rules file. */
   triggerAdded?: boolean;
+  /** Baseline evidence captured at apply time, used to measure later outcomes. */
+  evidence?: ToolEvidence;
+  /** Post-application effectiveness measurement from later sessions. */
+  outcome?: MutationOutcome;
+}
+
+export interface MutationOutcome {
+  status: "improved" | "neutral" | "regressed";
+  measuredAt: number;
+  /** Session start this measurement belongs to — the same session never counts twice. */
+  measuredSessionStart?: number;
+  /** Definitive measurements so far (unknown verdicts are not recorded). */
+  samples: number;
+  /** Consecutive "regressed" verdicts — 2+ marks a rollback candidate. */
+  consecutiveRegressed: number;
+  detail?: string;
 }
 
 export interface HarnessReportData {
@@ -72,6 +96,12 @@ export interface HarnessReportData {
     memoryCount?: number;
   };
   recentLedgerEntries: LedgerEntry[];
+  /** Entries carrying a measured post-application outcome. */
+  outcomeEntries?: LedgerEntry[];
+  /** Soft-cap and hygiene warnings (oversized SYSTEM.md, memory growth, ...). */
+  warnings?: string[];
+  /** Result of the missing-trigger audit run before rendering, when it ran. */
+  triggerAudit?: { repaired: number; skipped: number };
 }
 
 export interface TimelineEvent {
@@ -110,6 +140,23 @@ export interface DiagnosticProposal {
 export interface DiagnosticResult {
   frictions: DiagnosticFriction[];
   proposals: DiagnosticProposal[];
+  /** Optional transferable lessons distilled by the LLM (all four fields required). */
+  lessons?: DiagnosticLesson[];
+}
+
+export interface DiagnosticLesson {
+  /** Situation keyword: when this lesson applies. */
+  cue: string;
+  /** The transferable lesson itself. */
+  lesson: string;
+  /** Exact quote from the timeline that supports the lesson. */
+  evidence: string;
+  confidence: number;
+}
+
+export interface ReflectionResult {
+  proposals: HarnessProposal[];
+  lessons: DiagnosticLesson[];
 }
 
 export type LLMCompletionFn = (prompt: string) => Promise<string>;

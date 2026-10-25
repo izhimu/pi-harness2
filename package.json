@@ -1,6 +1,6 @@
 {
   "name": "@izhimu/pi-harness2",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Continuous self-improvement, recursive harness optimization, and reporting plugin for Pi and oh-my-pi (omp) based on Harness²",
   "type": "module",
   "main": "extensions/index.ts",

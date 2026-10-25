@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { LedgerEntry, HarnessProposal } from "./types.js";
+import type { LedgerEntry, HarnessProposal, MutationOutcome, ToolEvidence } from "./types.js";
 import { getHarnessPaths, type HostInfo } from "./host-detector.js";
 import { SurfaceManager } from "./surface.js";
 
@@ -98,6 +98,7 @@ export class ImprovementLedger {
     sessionId: string,
     previousContent?: string,
     triggerAdded?: boolean,
+    evidence?: ToolEvidence,
   ): LedgerEntry {
     const entry: LedgerEntry = {
       id: `harn-${Date.now()}-${++this.commitSeq}-${Math.random().toString(36).slice(2, 6).padEnd(4, "0")}`,
@@ -111,6 +112,7 @@ export class ImprovementLedger {
       appliedContent: proposal.contentDelta,
       status: "APPLIED",
       triggerAdded,
+      evidence: evidence ?? proposal.evidence,
     };
 
     withLedgerLock(`${this.ledgerPath}.lock`, () => {
@@ -119,6 +121,39 @@ export class ImprovementLedger {
       this.saveEntries(entries);
     });
     return entry;
+  }
+
+  /**
+   * Record a definitive post-application measurement. Only improved/neutral/regressed
+   * count as samples; consecutive regressions drive the rollback candidate policy.
+   * A session is measured at most once: repeat shutdowns for the same session
+   * (reload storms, duplicate events) are ignored via measuredSessionStart.
+   */
+  public recordOutcome(
+    id: string,
+    status: MutationOutcome["status"],
+    detail?: string,
+    sessionStart?: number,
+  ): LedgerEntry | undefined {
+    return withLedgerLock(`${this.ledgerPath}.lock`, () => {
+      const entries = this.getEntries();
+      const entry = entries.find((e) => e.id === id);
+      if (!entry || entry.status !== "APPLIED") return undefined;
+      const prev = entry.outcome;
+      if (sessionStart !== undefined && prev?.measuredSessionStart === sessionStart) {
+        return undefined; // this session already produced its verdict
+      }
+      entry.outcome = {
+        status,
+        measuredAt: Date.now(),
+        measuredSessionStart: sessionStart,
+        samples: (prev?.samples ?? 0) + 1,
+        consecutiveRegressed: status === "regressed" ? (prev?.consecutiveRegressed ?? 0) + 1 : 0,
+        detail: detail ?? prev?.detail,
+      };
+      this.saveEntries(entries);
+      return entry;
+    });
   }
 
   public rollback(id: string): { success: boolean; error?: string } {
