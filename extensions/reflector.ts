@@ -115,6 +115,98 @@ const CORRECTION_RE =
 const SIZE_ERROR_RE =
   /argument list too long|too large|e2big|out of memory|payload too large|string too long|maximum length|file too large/i;
 
+/** Call→error pairing evidence for one tool, extracted from the session timeline. */
+interface CallErrorPairing {
+  /** Distinct failing invocations (rendered args JSON), most recent last. */
+  failCalls: string[];
+  /** Shallow argument diff between the last failing call and the first success after it. */
+  contrast?: { diff: string[] };
+}
+
+function capValue(value: string | undefined): string {
+  const v = value ?? "undefined";
+  return v.length > 80 ? `${v.slice(0, 80)}…` : v;
+}
+
+/**
+ * The micro-scale contrastive step: when the same tool failed and then succeeded
+ * in one session, the difference between the two argument sets IS the lesson —
+ * extracted deterministically, no ground truth and no model required.
+ */
+function shallowArgDiff(failArgs: string, okArgs: string): string[] {
+  let f: unknown;
+  let o: unknown;
+  try {
+    f = JSON.parse(failArgs);
+    o = JSON.parse(okArgs);
+  } catch {
+    return [];
+  }
+  if (
+    !f ||
+    !o ||
+    typeof f !== "object" ||
+    typeof o !== "object" ||
+    Array.isArray(f) ||
+    Array.isArray(o)
+  ) {
+    return [];
+  }
+  const fo = f as Record<string, unknown>;
+  const oo = o as Record<string, unknown>;
+  const lines: string[] = [];
+  for (const key of new Set([...Object.keys(fo), ...Object.keys(oo)])) {
+    const fs = JSON.stringify(fo[key]);
+    const os = JSON.stringify(oo[key]);
+    if (fs === os) continue;
+    if (fo[key] === undefined) lines.push(`+ \`${key}\`: ${capValue(os)}`);
+    else if (oo[key] === undefined) lines.push(`- \`${key}\` removed`);
+    else lines.push(`~ \`${key}\`: ${capValue(fs)} -> ${capValue(os)}`);
+    if (lines.length >= 5) break;
+  }
+  return lines;
+}
+
+function renderCall(tool: string, args: string): string {
+  const safeArgs = args.replace(/`+/g, "'").slice(0, 160);
+  return `\`${tool}\` called with ${safeArgs}`;
+}
+
+/** Arg tokens that appear in almost every call of a tool and carry no identity. */
+const GENERIC_ARG_TOKENS = new Set([
+  "path", "command", "file", "line", "content", "text", "read", "write", "edit", "grep", "find", "search",
+]);
+
+/**
+ * The success/failure contrast is only a lesson when both calls were plausibly
+ * attempting the SAME operation. For per-call-varying tools (read, bash) the
+ * first success after a failure is usually a different task entirely — "read a
+ * different file" is noise, not a fix. Compare DISTINCTIVE tokens (deduped,
+ * generic key names dropped) and require 60% of the failing call's tokens in
+ * the succeeding call before presenting the diff.
+ */
+function argsAttemptSameOperation(failArgs: string, okArgs: string): boolean {
+  const distinctive = [...new Set(extractGroundingTokens(failArgs))].filter(
+    (t) => !GENERIC_ARG_TOKENS.has(t),
+  );
+  if (distinctive.length === 0) return false;
+  const okLower = okArgs.toLowerCase();
+  const hits = distinctive.filter((t) => okLower.includes(t)).length;
+  return hits / distinctive.length >= 0.6;
+}
+
+/**
+ * Corroboration for correction-regex hits: the message shares at least one
+ * substantial token with what the agent produced earlier — corrections mostly
+ * introduce NEW wording, so a single anchored match (tool name, identifier,
+ * CJK bigram) is the right bar, not the 2-token grounding used for LLM output.
+ */
+function corroboratedByPrior(content: string, priorContext: string): boolean {
+  if (!priorContext) return false;
+  const tokens = extractGroundingTokens(content);
+  return tokens.some((t) => priorContext.includes(t));
+}
+
 export function isUserCorrection(content: string): boolean {
   return CORRECTION_RE.test(content);
 }
@@ -233,18 +325,31 @@ export class ExperienceReflector {
     const toolErrors = new Map<string, string[]>();
     const userCorrections: string[] = [];
 
-    // Passive analysis of conversation turns
+    // Dual-signal correction detection: a correction-regex hit alone is too noisy.
+    // It must be corroborated by (i) a tool error in the agent segment that just
+    // finished, or (ii) token overlap with what the agent produced earlier — the
+    // user quoting or reacting to the agent's own output.
+    let segmentHadError = false;
+    let priorContext = "";
     for (const ev of timeline) {
       if (ev.type === "user_message" && ev.content.trim().length > 0) {
         const content = ev.content.trim();
-        if (isUserCorrection(content)) {
+        if (
+          isUserCorrection(content) &&
+          (segmentHadError || corroboratedByPrior(content, priorContext))
+        ) {
           userCorrections.push(content);
         }
-      } else if (ev.type === "tool_result" && ev.isError && ev.toolName) {
+        segmentHadError = false; // this message starts a new agent segment
+        continue;
+      }
+      if (ev.type === "tool_result" && ev.isError && ev.toolName) {
+        segmentHadError = true;
         const errors = toolErrors.get(ev.toolName) ?? [];
         errors.push(ev.content || "Execution failed");
         toolErrors.set(ev.toolName, errors);
       }
+      priorContext = `${priorContext} ${ev.toolName ?? ""} ${ev.content}`.toLowerCase().slice(-8000);
     }
 
     // 1. Business & Domain Invariants from User Feedback (c2_rules).
@@ -266,10 +371,12 @@ export class ExperienceReflector {
       });
     }
 
-    // 2. High-Frequency Tool Friction (c6_skill) — grounded in >= 2 recorded failures
+    // 2. High-Frequency Tool Friction (c6_skill) — grounded in >= 2 recorded
+    // failures, enriched with call→error pairs and the success/failure contrast
+    const pairings = this.buildCallEvidence(timeline);
     for (const [tool, errors] of toolErrors.entries()) {
       if (errors.length >= 2) {
-        proposals.push(this.buildToolSkillProposal(tool, errors, undefined));
+        proposals.push(this.buildToolSkillProposal(tool, errors, undefined, pairings.get(tool)));
       }
     }
 
@@ -398,10 +505,59 @@ export class ExperienceReflector {
     };
   }
 
+  /**
+   * Pair tool calls with their results (by toolCallId) to extract, per tool:
+   * the distinct failing invocations, and the argument diff between the last
+   * failure and the first success that followed it.
+   */
+  private buildCallEvidence(timeline: TimelineEvent[]): Map<string, CallErrorPairing> {
+    const callsById = new Map<string, string>();
+    for (const ev of timeline) {
+      if (ev.type === "tool_call" && ev.toolCallId) callsById.set(ev.toolCallId, ev.content);
+    }
+    interface ToolStat {
+      fails: string[];
+      sawFail: boolean;
+      firstOk?: string;
+      lastFailBeforeOk?: string;
+    }
+    const perTool = new Map<string, ToolStat>();
+    for (const ev of timeline) {
+      if (ev.type !== "tool_result" || !ev.toolName) continue;
+      const args = ev.toolCallId ? (callsById.get(ev.toolCallId) ?? "") : "";
+      const stat = perTool.get(ev.toolName) ?? { fails: [], sawFail: false };
+      if (ev.isError) {
+        stat.fails.push(args);
+        stat.sawFail = true;
+      } else if (stat.sawFail && !stat.firstOk && args) {
+        stat.firstOk = args;
+        stat.lastFailBeforeOk = stat.fails[stat.fails.length - 1];
+      }
+      perTool.set(ev.toolName, stat);
+    }
+    const out = new Map<string, CallErrorPairing>();
+    for (const [tool, stat] of perTool) {
+      if (stat.fails.length < 2) continue; // only enrich skills the >= 2 threshold proposes
+      const failCalls = [...new Set(stat.fails.filter((a) => a.length > 0))].slice(-2);
+      const pairing: CallErrorPairing = { failCalls };
+      if (
+        stat.firstOk &&
+        stat.lastFailBeforeOk !== undefined &&
+        argsAttemptSameOperation(stat.lastFailBeforeOk, stat.firstOk)
+      ) {
+        const diff = shallowArgDiff(stat.lastFailBeforeOk, stat.firstOk);
+        if (diff.length > 0) pairing.contrast = { diff };
+      }
+      out.set(tool, pairing);
+    }
+    return out;
+  }
+
   private buildToolSkillProposal(
     tool: string,
     errors: string[],
     frequency: number | undefined,
+    pairing?: CallErrorPairing,
   ): HarnessProposal {
     const cleanTool = tool.replace(/[\r\n`]+/g, " ").trim();
     const baseTool = cleanTool.replace(/[^a-zA-Z0-9_-]/g, "") || "tool";
@@ -411,6 +567,18 @@ export class ExperienceReflector {
 
     const cleanErrors = errors.slice(0, 3).map((e) => `> ${sanitizeErrorSnippet(e)}`);
     const frequencyNote = frequency !== undefined ? `Diagnosed from ${frequency} failure(s) in session:` : "";
+    const failCallLines = pairing && pairing.failCalls.length > 0
+      ? ["", "## Failing invocation(s)", ...pairing.failCalls.map((a) => `- ${renderCall(cleanTool, a)}`)]
+      : [];
+    const contrastLines =
+      pairing?.contrast && pairing.contrast.diff.length > 0
+        ? [
+            "",
+            "## What changed when it worked",
+            "Compared with the last failing call, the first successful call differed in:",
+            ...pairing.contrast.diff.map((l) => `- ${l}`),
+          ]
+        : [];
     const contentDelta = [
       `---`,
       `name: ${skillName}`,
@@ -420,6 +588,8 @@ export class ExperienceReflector {
       `# ${cleanTool} Best Practices and Error Recovery`,
       ...(frequencyNote ? [frequencyNote] : []),
       ...cleanErrors,
+      ...failCallLines,
+      ...contrastLines,
       ``,
       `## Recommended Procedure`,
       `1. Verify command syntax, paths, and tool constraints prior to execution.`,

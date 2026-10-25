@@ -251,7 +251,9 @@ export function readSession(hostInfo: HostInfo, cwd: string): SessionData {
               type: "tool_call",
               toolName: typeof b.name === "string" ? b.name : undefined,
               toolCallId: typeof b.id === "string" ? b.id : undefined,
-              content: JSON.stringify(b.arguments ?? {}).slice(0, 300),
+              // Args feed call→error pairing and success/failure diffs, so keep
+              // more than a preview; the diagnostic prompt budget bounds size.
+              content: JSON.stringify(b.arguments ?? {}).slice(0, 1000),
             };
             state.entries.push({ bytes: line.length + 1, timeline: ev });
             state.totalBytes += line.length + 1;

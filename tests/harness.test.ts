@@ -895,13 +895,14 @@ describe("pi-harness2 test suite", () => {
   test("ExperienceReflector should diagnose corrections and tool failures into proposals", async () => {
     const reflector = new ExperienceReflector(piHostIn());
     const timeline: TimelineEvent[] = [
+      // The agent's segment fails first — the correction below responds to it
+      { timestamp: 1, type: "tool_result", toolName: "bash", isError: true, content: "error 1" },
+      { timestamp: 2, type: "tool_result", toolName: "bash", isError: true, content: "error 2" },
       {
-        timestamp: 1,
+        timestamp: 3,
         type: "user_message",
         content: "不对，不能使用全局大事务，必须用 requiresNewTemplate 小事务",
       },
-      { timestamp: 2, type: "tool_result", toolName: "bash", isError: true, content: "error 1" },
-      { timestamp: 3, type: "tool_result", toolName: "bash", isError: true, content: "error 2" },
     ];
 
     const proposals = reflector.diagnoseTimeline(timeline);
@@ -924,6 +925,106 @@ describe("pi-harness2 test suite", () => {
     expect(isUserCorrection("不对，不能使用全局事务")).toBe(true);
     expect(isUserCorrection("That's wrong — use batch inserts instead of per-row loops")).toBe(true);
     expect(isUserCorrection("don't use eval for JSON parsing")).toBe(true);
+  });
+
+  test("corrections require corroboration: bare regex hits are dropped", () => {
+    const reflector = new ExperienceReflector(piHostIn());
+    const ruleCount = (timeline: TimelineEvent[]) =>
+      reflector.diagnoseTimeline(timeline).filter((p) => p.component === "c2_rules").length;
+
+    // A correction with no preceding error and no prior agent context → dropped
+    expect(
+      ruleCount([{ timestamp: 1, type: "user_message", content: "That's wrong, the retry loop should stop" }]),
+    ).toBe(0);
+
+    // The same message right after a tool error in the finished segment → kept
+    expect(
+      ruleCount([
+        { timestamp: 1, type: "tool_result", toolName: "bash", isError: true, content: "boom" },
+        { timestamp: 2, type: "user_message", content: "That's wrong, the retry loop should stop" },
+      ]),
+    ).toBe(1);
+
+    // The user reacting to the agent's own earlier output → kept
+    expect(
+      ruleCount([
+        { timestamp: 1, type: "assistant_thought", content: "我将用全局大事务包裹批量审批" },
+        { timestamp: 2, type: "user_message", content: "不对，不能用全局大事务" },
+      ]),
+    ).toBe(1);
+  });
+
+  test("tool skills pair failing invocations and capture the success contrast", () => {
+    const reflector = new ExperienceReflector(ompHostIn());
+    const call = (id: string, args: object): TimelineEvent => ({
+      timestamp: 1,
+      type: "tool_call",
+      toolName: "bash",
+      toolCallId: id,
+      content: JSON.stringify(args),
+    });
+    const result = (id: string, isError: boolean, text: string): TimelineEvent => ({
+      timestamp: 2,
+      type: "tool_result",
+      toolName: "bash",
+      toolCallId: id,
+      isError,
+      content: text,
+    });
+
+    const proposals = reflector.diagnoseTimeline([
+      call("t0", { command: "rm -rf build tmp", path: "src/my file.txt" }),
+      result("t0", true, "rm: cannot remove 'src/my file.txt'"),
+      call("t1", { command: "rm -rf build tmp", path: "src/my file.txt" }),
+      result("t1", true, "rm: cannot remove 'src/my file.txt'"),
+      call("t2", { command: "rm -rf build tmp", path: '"src/my file.txt"' }),
+      result("t2", false, "removed"),
+    ]);
+
+    const skill = proposals.find((p) => p.component === "c6_skill")!;
+    expect(skill).toBeDefined();
+    // The failing invocation is paired with its triggering call
+    expect(skill.contentDelta).toContain("Failing invocation(s)");
+    expect(skill.contentDelta).toContain('"path":"src/my file.txt"');
+    // The success/failure argument diff is the lesson
+    expect(skill.contentDelta).toContain("What changed when it worked");
+    expect(skill.contentDelta).toContain("`path`");
+    expect(skill.contentDelta).toContain("->");
+  });
+
+  test("success on a different task must not produce a pseudo-lesson", () => {
+    const reflector = new ExperienceReflector(ompHostIn());
+    const call = (id: string, args: object): TimelineEvent => ({
+      timestamp: 1,
+      type: "tool_call",
+      toolName: "read",
+      toolCallId: id,
+      content: JSON.stringify(args),
+    });
+    const result = (id: string, isError: boolean, text: string): TimelineEvent => ({
+      timestamp: 2,
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: id,
+      isError,
+      content: text,
+    });
+
+    // The read tool fails on one file, then the agent simply reads a DIFFERENT
+    // file — the argument diff would be "read something else", which is noise
+    const proposals = reflector.diagnoseTimeline([
+      call("t0", { path: "plugins/caveman/opencode/plugin.js", i: "List opencode plugin" }),
+      result("t0", true, "Path not found"),
+      call("t1", { path: "plugins/caveman/opencode/plugin.js", i: "List opencode plugin" }),
+      result("t1", true, "Path not found"),
+      call("t2", { path: "CLAUDE.md", i: "Read the project conventions" }),
+      result("t2", false, "# Project conventions ..."),
+    ]);
+
+    const skill = proposals.find((p) => p.component === "c6_skill")!;
+    expect(skill).toBeDefined();
+    expect(skill.contentDelta).toContain("Failing invocation(s)");
+    expect(skill.contentDelta).not.toContain("What changed when it worked");
   });
 
   test("generated skill content must sanitize tool error snippets", () => {
@@ -1031,7 +1132,8 @@ describe("pi-harness2 test suite", () => {
 
     const reflector = new ExperienceReflector(piHostIn(), failingLLM);
     const timeline: TimelineEvent[] = [
-      { timestamp: 1, type: "user_message", content: "不对，必须使用小事务隔离" },
+      { timestamp: 1, type: "assistant_thought", content: "我准备用全局大事务来包裹这批操作" },
+      { timestamp: 2, type: "user_message", content: "不对，必须使用小事务隔离" },
     ];
 
     const proposals = (await reflector.diagnoseTimelineAsync(timeline)).proposals;
@@ -1221,8 +1323,11 @@ describe("pi-harness2 test suite", () => {
 
     await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
 
+    // The assistant proposes a global transaction; the user corrects it —
+    // prior-context corroboration makes this a real correction signal
     writeSessionFixture([
-      { role: "user", content: [{ type: "text", text: "不对，必须使用 requiresNewTemplate 小事务" }] },
+      { role: "assistant", content: [{ type: "text", text: "我打算用全局大事务来处理这批审批" }] },
+      { role: "user", content: [{ type: "text", text: "不对，必须使用 requiresNewTemplate 小事务隔离" }] },
     ]);
     await rt.fire("session_shutdown", ctx);
 
@@ -1510,8 +1615,12 @@ describe("pi-harness2 test suite", () => {
     const rt = createMockPi();
     const ctx = createMockCtx(tmpDir);
 
-    const correction = [{ role: "user", content: [{ type: "text", text: "不对，必须使用 requiresNewTemplate 小事务隔离" }] }];
-    writeSessionFixture(correction, "w-s1", tmpDir, tsInDays(40));
+    const correctionSession = [
+      // The assistant proposes, the user corrects — prior-context corroboration
+      { role: "assistant", content: [{ type: "text", text: "我打算用全局大事务来处理这批审批" }] },
+      { role: "user", content: [{ type: "text", text: "不对，必须使用 requiresNewTemplate 小事务隔离" }] },
+    ];
+    writeSessionFixture(correctionSession, "w-s1", tmpDir, tsInDays(40));
     await rt.fire("agent_settled", ctx);
     await rt.command("harness-apply").handler("all", ctx as unknown as ExtensionCommandContext);
 
@@ -1520,7 +1629,7 @@ describe("pi-harness2 test suite", () => {
     expect(ledger.getEntries()[0]!.component).toBe("c2_rules");
 
     // The user repeats the same correction next session → regression signal
-    writeSessionFixture(correction, "w-s2", tmpDir, tsInDays(41));
+    writeSessionFixture(correctionSession, "w-s2", tmpDir, tsInDays(41));
     await rt.fire("session_shutdown", ctx);
     const outcome = ledger.getEntries()[0]!.outcome;
     expect(outcome?.status).toBe("regressed");

@@ -2,6 +2,13 @@
 
 All notable changes to `@izhimu/pi-harness2` will be documented in this file.
 
+## [0.3.1] - 2026-10-25
+
+### Added
+- **Call→error pairing in generated skills**: failing invocations are paired with their triggering command arguments (matched by `toolCallId`), so a skill now shows "you ran X, it failed with Y" instead of a bare error line. Tool-call arguments are retained up to 1000 chars in the timeline for this purpose.
+- **Success/failure argument contrast (deterministic answer-free contrast)**: when the same tool failed and then succeeded within one session, the skill captures the shallow argument diff between the last failure and the first success under "What changed when it worked" — the micro-scale translation of the paper's contrastive step, with no model and no ground truth required. The diff is only presented when both calls plausibly attempted the same operation (≥60% of the failing call's distinctive tokens — deduped, generic key names excluded — appear in the succeeding call); a success on a different file/task produces no pseudo-lesson.
+- **Dual-signal correction detection**: a correction-regex hit alone no longer produces a rule proposal. It must be corroborated by (i) a tool error in the agent segment that just finished, or (ii) a token anchor shared with the agent's earlier output (the user quoting/reacting to what the agent did). Bare first-message regex hits are dropped.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added

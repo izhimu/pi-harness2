@@ -92,8 +92,8 @@ pi-harness2/
   - 手动触发：运行 `/harness-reflect`。
 - **LLM 反思通道**：仅在显式触发点（`/harness-reflect`、auto 模式 `session_shutdown`）调用，复用宿主当前模型（`ctx.model` + `@earendil-works/pi-ai` 的 `completeSimple`，宿主进程内解析、密钥随宿主注入）；prompt 设预算（≤300 事件 / 48KB 字符，保留最近事件）；prompt 内置 Harness² 原文的 **Answer-Free** 与 **Evidence-Boundary** 条款；被验证器拒绝的提案将携带拒绝原因回填重试一次；任何环节失败自动降级为确定性诊断。
 - **确定性诊断（降级路径，决策树分流）**：
-  1. 工具错误聚类（同一工具 ≥ 2 次）──► 生成 c6 Skill（错误摘要经消毒：仅首行、去 Markdown/HTML 语法、限长，防止提示注入持久化）。
-  2. 显式用户纠错（强信号正则，中英文）──► 提议 c2 Rule，标记 `autoApplicable=false`（auto 模式下仍需人工审查，避免规则污染）。
+  1. 工具错误聚类（同一工具 ≥ 2 次）──► 生成 c6 Skill：错误摘要经消毒（仅首行、去 Markdown/HTML 语法、限长），并按 `toolCallId` **配对触发命令**（「运行了什么、失败于什么」）；若同工具随后成功过一次，自动提取**成败参数 diff**（「What changed when it worked」段）——论文对比思想的确定性微缩。
+  2. 显式用户纠错（**双信号**：纠错正则命中 + 佐证——前一段 agent 段落出现过工具错误，或消息与 agent 先前输出存在 token 锚点重叠）──► 提议 c2 Rule，标记 `autoApplicable=false`（auto 模式下仍需人工审查，避免规则污染）。
   3. 尺寸上限类错误（argument list too long / too large 等 ≥ 2 次）──► 提议 c7 分批执行脚本（`chunked-run-<tool>.sh`，人工审查）。
   4. 单轮工具调用 ≥ 12 次且含 ≥ 2 次错误（上下文过载轮次）──► 提议 c5 批处理子代理（人工审查）。
   5. c8 中间件生成因风险过高明确不做。
