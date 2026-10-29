@@ -55,12 +55,12 @@ When an agent encounters friction — such as tool execution retry loops, syntax
 
 For **pi**:
 ```bash
-pi install @izhimu/pi-harness2
+pi install npm:@izhimu/pi-harness2
 ```
 
 For **oh-my-pi (omp)**:
 ```bash
-omp plugin install @izhimu/pi-harness2
+omp plugin install npm:@izhimu/pi-harness2
 ```
 
 ### From git
