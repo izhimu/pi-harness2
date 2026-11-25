@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { detectHost, getHarnessPaths } from "./host-detector.js";
+import { detectHost, getHarnessPaths, type HostInfo } from "./host-detector.js";
 import { readSession, deriveFrictionPoints, topFailingTools } from "./session-reader.js";
 import { SurfaceManager } from "./surface.js";
 import { ImprovementLedger } from "./ledger.js";
@@ -72,9 +72,22 @@ export interface HarnessOptions {
   /**
    * Host-specific reflection LLM: reuses the session's active model through the
    * host's own pi-ai runtime (API keys included). Any failure returns undefined
-   * and the reflector degrades to deterministic diagnosis.
+   * and the reflector degrades to deterministic diagnosis. `opts.signal` is the
+   * OMP `session_before_shutdown` close signal: hosts must forward it to their
+   * completion call so a close that stops waiting cancels the in-flight request.
    */
-  createLLMCaller(ctx: HarnessContext): Promise<LLMCompletionFn | undefined>;
+  createLLMCaller(ctx: HarnessContext, opts?: { signal?: AbortSignal }): Promise<LLMCompletionFn | undefined>;
+  /**
+   * OMP-only lifecycle events. Hosts that emit them (OMP) pass the event
+   * names so the harness registers the corresponding hooks; hosts without
+   * them (Pi) omit these and the hooks are never registered.
+   */
+  /** Pre-switch capture event (`session_before_switch` on OMP). */
+  sessionBeforeSwitchEvent?: string;
+  /** Post-switch event (`session_switch` on OMP). */
+  sessionSwitchEvent?: string;
+  /** Pre-shutdown event with a comfortable budget (`session_before_shutdown` on OMP). */
+  sessionBeforeShutdownEvent?: string;
 }
 
 export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
@@ -83,6 +96,77 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
   let lastCwd: string | undefined;
   const pendingProposals = new Map<string, HarnessProposal>();
   const autoAppliedKeys = new Set<string>();
+
+  /**
+   * Outgoing session captured at OMP `session_before_switch`. The switch can
+   * still be canceled, so this is capture-only — no finalization side effects.
+   * The snapshot is needed because session lookup matches recordings by cwd,
+   * which is only trustworthy while the outgoing session is still active.
+   */
+  interface OutgoingSnapshot {
+    /** Detached copy of the outgoing ctx (values as of capture, not a live reference). */
+    ctx: HarnessContext;
+    hostInfo: HostInfo;
+    cwd: string;
+    mode: EvolutionMode;
+    timeline: TimelineEvent[];
+    records: ToolExecutionRecord[];
+  }
+  let pendingSwitch: OutgoingSnapshot | undefined;
+
+  /**
+   * Set when an OMP `session_before_shutdown` completed full finalization and
+   * the close signal did not abort: the trailing `session_shutdown` then skips
+   * finalization entirely, since its bounded deterministic fallback would
+   * re-evolve the same session (autoAppliedKeys only dedupes identical
+   * proposal keys, not distinct ones). Cleared on new session / switch and
+   * whenever the pre-shutdown signal aborts, so a forced close still gets the
+   * deterministic fallback. Never set on hosts without a pre-shutdown event
+   * (Pi), whose single `session_shutdown` carries the full finalization.
+   */
+  let preShutdownFinalized = false;
+
+  /**
+   * Generation guard for pre-shutdown attempts: bumped on every pre-shutdown
+   * event and invalidated on session_start / session_switch / session_shutdown,
+   * so a late abort from a stale close signal cannot clear a later session's
+   * marker.
+   */
+  let preShutdownAttempt = 0;
+  /** Abort listener registered for the current pre-shutdown attempt's signal. */
+  let preShutdownAbort: { signal: AbortSignal; listener: () => void } | undefined;
+
+  function clearPreShutdownAbort(): void {
+    if (preShutdownAbort) {
+      preShutdownAbort.signal.removeEventListener("abort", preShutdownAbort.listener);
+      preShutdownAbort = undefined;
+    }
+  }
+
+  /** Invalidate any in-flight/returned pre-shutdown attempt and its listener. */
+  function invalidatePreShutdownAttempt(): void {
+    preShutdownAttempt++;
+    clearPreShutdownAbort();
+  }
+
+  /** Options for end-of-session finalization paths (shutdown, pre-shutdown, switch). */
+  interface FinalizeOptions {
+    /** LLM-backed reflection: only on paths with a comfortable time budget. */
+    allowLLM: boolean;
+    /** Awaiting a session reload: never on paths where the process is exiting. */
+    allowReload: boolean;
+    reason?: string;
+    /** OMP session_before_shutdown close signal; aborts = close stopped waiting. */
+    signal?: AbortSignal;
+  }
+
+  function normalizeCwd(cwd: string): string {
+    try {
+      return fs.realpathSync(cwd);
+    } catch {
+      return path.resolve(cwd);
+    }
+  }
 
   function addPendingProposals(proposals: HarnessProposal[]): number {
     let added = 0;
@@ -128,6 +212,13 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
     }
   }
 
+  /** Session data captured before a switch; when present, no re-read by cwd. */
+  interface SessionRecording {
+    hostInfo: HostInfo;
+    timeline: TimelineEvent[];
+    records: ToolExecutionRecord[];
+  }
+
   interface CollectOptions {
     /**
      * LLM diagnosis is priced per token and sessions can be huge, so it only runs
@@ -135,15 +226,24 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
      * Per-cycle loop-end diagnosis stays deterministic and cheap.
      */
     allowLLM: boolean;
+    /** Forwarded to the host LLM caller so an aborted close cancels the request. */
+    signal?: AbortSignal;
   }
 
-  async function collectProposals(ctx: HarnessContext, opts: CollectOptions): Promise<HarnessProposal[]> {
-    const hostInfo = detectHost(ctx.cwd);
-    const { timeline, records } = readSession(hostInfo, ctx.cwd);
+  async function collectProposals(
+    ctx: HarnessContext,
+    opts: CollectOptions,
+    recording?: SessionRecording,
+  ): Promise<HarnessProposal[]> {
+    // A captured recording (session switch) wins over the active-session read:
+    // after a switch landed, readSession(ctx.cwd) would match the incoming
+    // project's newest recording instead of the outgoing session's.
+    const hostInfo = recording?.hostInfo ?? detectHost(ctx.cwd);
+    const { timeline, records } = recording ?? readSession(hostInfo, ctx.cwd);
     const frictions = deriveFrictionPoints(records);
     if (timeline.length === 0 && frictions.length === 0) return [];
 
-    const llmCaller = opts.allowLLM ? await options.createLLMCaller(ctx) : undefined;
+    const llmCaller = opts.allowLLM ? await options.createLLMCaller(ctx, { signal: opts.signal }) : undefined;
     const reflector = new ExperienceReflector(hostInfo, llmCaller);
 
     if (timeline.length > 0) {
@@ -228,7 +328,7 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
   async function handleRollbackCandidates(
     ctx: HarnessContext,
     ledger: ImprovementLedger,
-    shutdownReason?: string,
+    opts: { allowReload: boolean; reason?: string },
   ): Promise<void> {
     const candidates = ledger
       .getEntries()
@@ -246,8 +346,9 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
           ctx.ui.notify(`[pi-harness2] Auto-rolled back ineffective mutation ${entry.id}: ${entry.summary}`, "warning");
         }
       }
-      // Reloading is pointless when the host process is on its way out
-      if (rolled > 0 && shutdownReason !== "quit") {
+      // Reloading is pointless when the host process is on its way out or the
+      // session already switched away — only normal pre-close paths may await it.
+      if (rolled > 0 && opts.allowReload && opts.reason !== "quit") {
         await reloadSessionSafe(ctx);
       }
     } else {
@@ -279,15 +380,19 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
     }
   }
 
-  async function autoEvolve(ctx: HarnessContext): Promise<void> {
-    const proposals = await collectProposals(ctx, { allowLLM: true });
+  async function autoEvolve(ctx: HarnessContext, opts: FinalizeOptions, recording?: SessionRecording): Promise<void> {
+    const proposals = await collectProposals(ctx, opts, recording);
     if (proposals.length === 0) return;
+    // The close stopped waiting while the LLM was reflecting: applying the
+    // results now would mutate the project after the host moved on.
+    if (opts.signal?.aborted) return;
 
-    const hostInfo = detectHost(ctx.cwd);
+    const hostInfo = recording?.hostInfo ?? detectHost(ctx.cwd);
     const surface = new SurfaceManager(hostInfo);
     const ledger = new ImprovementLedger(hostInfo);
     let heldForReview = 0;
     for (const p of proposals) {
+      if (opts.signal?.aborted) break;
       // Heuristic-evidence proposals (raw user-correction rules) are held for
       // interactive review even in auto mode; only evidence-grounded mutations
       // (recorded tool failures, LLM proposals that passed grounding) auto-apply.
@@ -315,15 +420,61 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
     }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  /**
+   * Measure the completed session and evolve — used by the live-session paths
+   * (session_before_shutdown, session_shutdown) which may still read the active
+   * recording through the current cwd.
+   */
+  async function finalizeSession(ctx: HarnessContext, opts: FinalizeOptions): Promise<void> {
+    const hostInfo = detectHost(ctx.cwd);
+    const ledger = new ImprovementLedger(hostInfo);
+    const { timeline, records } = readSession(hostInfo, ctx.cwd);
+    const sessionStart = timeline[0]?.timestamp ?? Date.now();
+    updateOutcomes(ledger, timeline, records, sessionStart);
+    await handleRollbackCandidates(ctx, ledger, opts);
+    if (currentMode === "auto") {
+      await autoEvolve(ctx, opts);
+    }
+  }
+
+  /**
+   * Finalize an outgoing session after a successful switch, from the snapshot
+   * captured at session_before_switch: the recording must come from the
+   * outgoing project, and rollback/evolution decisions belong to the outgoing
+   * project's mode — before the new project's persisted state loads.
+   */
+  async function finalizeOutgoing(snap: OutgoingSnapshot, opts: FinalizeOptions): Promise<void> {
+    const ledger = new ImprovementLedger(snap.hostInfo);
+    const sessionStart = snap.timeline[0]?.timestamp ?? Date.now();
+    updateOutcomes(ledger, snap.timeline, snap.records, sessionStart);
+    const restoredMode = currentMode;
+    currentMode = snap.mode;
+    try {
+      await handleRollbackCandidates(snap.ctx, ledger, opts);
+      if (snap.mode === "auto") {
+        await autoEvolve(snap.ctx, opts, {
+          hostInfo: snap.hostInfo,
+          timeline: snap.timeline,
+          records: snap.records,
+        });
+      }
+    } finally {
+      currentMode = restoredMode;
+    }
+  }
+
+  /**
+   * Shared new-session state refresh: a session_start and a successful OMP
+   * session_switch both land here — reset cycle state, isolate per-project
+   * proposal state when the cwd changed, and reload the persisted mode.
+   */
+  function refreshSessionState(ctx: HarnessContext): void {
     cycleHandled = false;
     lastCandidateKey = "";
-    let normCwd: string;
-    try {
-      normCwd = fs.realpathSync(ctx.cwd);
-    } catch {
-      normCwd = path.resolve(ctx.cwd);
-    }
+    pendingSwitch = undefined;
+    preShutdownFinalized = false;
+    invalidatePreShutdownAttempt();
+    const normCwd = normalizeCwd(ctx.cwd);
     // Clear pending proposals if project/cwd changed to avoid cross-cwd leakage
     if (lastCwd && lastCwd !== normCwd) {
       pendingProposals.clear();
@@ -337,7 +488,57 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
       `[pi-harness2] Active on ${hostInfo.host.toUpperCase()} (${hostInfo.projectConfigDir}) [Mode: ${currentMode}]`,
       "info",
     );
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    refreshSessionState(ctx);
   });
+
+  // OMP session switch: capture the outgoing session BEFORE the switch (the
+  // switch can still be canceled at this point, and readSession matches
+  // recordings by cwd, which is only valid while the outgoing session is
+  // active). Finalization runs only after a successful `session_switch`.
+  // Registered only when the host adapter supplies these OMP-only events.
+  if (options.sessionBeforeSwitchEvent) {
+    pi.on(options.sessionBeforeSwitchEvent, (_event, ctx) => {
+      try {
+        const hostInfo = detectHost(ctx.cwd);
+        const { timeline, records } = readSession(hostInfo, ctx.cwd);
+        const normCwd = normalizeCwd(ctx.cwd);
+        pendingSwitch = {
+          // Detach from the live ctx object: the host may mutate cwd/model/ui in
+          // place when the switch lands, and finalization must stay bound to the
+          // outgoing session's values.
+          ctx: { cwd: normCwd, model: ctx.model, ui: ctx.ui },
+          hostInfo,
+          cwd: normCwd,
+          mode: currentMode,
+          timeline,
+          records,
+        };
+      } catch {
+        pendingSwitch = undefined;
+      }
+    });
+  }
+
+  if (options.sessionSwitchEvent) {
+    pi.on(options.sessionSwitchEvent, async (_event, ctx) => {
+      const outgoing = pendingSwitch;
+      pendingSwitch = undefined;
+      if (outgoing) {
+        try {
+          // Finalize the captured outgoing project: no reload (that session is
+          // gone) and the close is a normal switch, so LLM reflection is allowed.
+          await finalizeOutgoing(outgoing, { allowLLM: true, allowReload: false });
+        } catch {
+          // Switch finalization must never block or crash the switch itself
+        }
+      }
+      // The new session's project state replaces the outgoing project's.
+      refreshSessionState(ctx);
+    });
+  }
 
   // Per-cycle diagnosis: when the agent loop ends, surface review-mode proposals
   // while the user is still around to inspect them. Deterministic only — the LLM
@@ -372,19 +573,69 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
   // candidates, then auto mode applies grounded proposals for the next session.
   // reason "reload" means the session CONTINUES (extension hot reload) — nothing
   // is final yet, so no measurement, no evolution, no rollbacks on that path.
+  //
+  // OMP splits this across two events: `session_before_shutdown` (before the
+  // close, ~30s budget, AbortSignal) carries the LLM-backed autoEvolve, and the
+  // final `session_shutdown` (process exit, ~2s budget) runs only bounded
+  // deterministic bookkeeping — no LLM calls, no reload awaits. Everything on
+  // the short path is deduped (autoAppliedKeys, session-start timestamps,
+  // lastCandidateKey), so effects still land exactly once when both fire.
+  // Pi has no pre-shutdown event, so its single `session_shutdown` carries the
+  // full finalization including LLM reflection.
+  const hasPreShutdown = options.sessionBeforeShutdownEvent !== undefined;
+
+  if (options.sessionBeforeShutdownEvent) {
+    pi.on(options.sessionBeforeShutdownEvent, async (event, ctx) => {
+      try {
+        const reason = (event as { reason?: string } | undefined)?.reason;
+        if (reason === "reload") return;
+        const signal = (event as { signal?: AbortSignal } | undefined)?.signal;
+        // Track this attempt so the signal can still clear the marker after
+        // this handler returns: the close may stop waiting (abort) between
+        // finalization and process exit, and the trailing session_shutdown
+        // must then run its deterministic fallback.
+        const attempt = ++preShutdownAttempt;
+        clearPreShutdownAbort();
+        if (signal) {
+          const listener = () => {
+            preShutdownAbort = undefined;
+            // Only the still-current attempt may clear the marker; a stale
+            // close's abort must not touch a later session's state.
+            if (attempt === preShutdownAttempt) preShutdownFinalized = false;
+          };
+          signal.addEventListener("abort", listener, { once: true });
+          preShutdownAbort = { signal, listener };
+        }
+        // The process is closing: no reload waits, even though the LLM-backed
+        // finalization itself runs here.
+        await finalizeSession(ctx, { allowLLM: true, allowReload: false, reason, signal });
+        // Marker only when the full finalization actually completed AND the
+        // close is still waiting on us — an abort mid/after work means the
+        // forced shutdown must still run its deterministic fallback below.
+        preShutdownFinalized = attempt === preShutdownAttempt && !signal?.aborted;
+      } catch {
+        // Session end evolution must never crash host
+      }
+    });
+  }
+
   pi.on("session_shutdown", async (event, ctx) => {
     try {
       const reason = (event as { reason?: string } | undefined)?.reason;
       if (reason === "reload") return;
-      const hostInfo = detectHost(ctx.cwd);
-      const ledger = new ImprovementLedger(hostInfo);
-      const { timeline, records } = readSession(hostInfo, ctx.cwd);
-      const sessionStart = timeline[0]?.timestamp ?? Date.now();
-      updateOutcomes(ledger, timeline, records, sessionStart);
-      await handleRollbackCandidates(ctx, ledger, reason);
-      if (currentMode === "auto") {
-        await autoEvolve(ctx);
-      }
+      pendingSwitch = undefined; // a switch canceled before close leaves no dangling snapshot
+      // Hosts with a pre-shutdown event (OMP) already ran full finalization
+      // there; this final event only fits bounded deterministic bookkeeping
+      // within the ~2s close budget. When that finalization completed, skip it
+      // here — the deterministic fallback would re-evolve the same session.
+      // Hosts without one (Pi) get the full finalization, LLM reflection
+      // included.
+      const skipFinalization = hasPreShutdown && preShutdownFinalized;
+      // This shutdown supersedes any pre-shutdown attempt: a late abort from
+      // its close signal must not clear a later session's marker.
+      invalidatePreShutdownAttempt();
+      if (skipFinalization) return;
+      await finalizeSession(ctx, { allowLLM: !hasPreShutdown, allowReload: !hasPreShutdown, reason });
     } catch {
       // Session end evolution must never crash host
     }

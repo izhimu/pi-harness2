@@ -38,6 +38,8 @@ async function createPiLLMCaller(ctx: HarnessContext): Promise<LLMCompletionFn |
 }
 
 export default function piHarness2PiExtension(pi: ExtensionAPI) {
-  // Pi has no `agent_end`; `agent_settled` is the loop-end signal.
+  // Pi has no `agent_end`; `agent_settled` is the loop-end signal. Pi emits
+  // none of the OMP-only switch/pre-shutdown events, so those options stay
+  // unset and its single `session_shutdown` carries full LLM finalization.
   registerHarness(pi, { loopEndEvent: "agent_settled", createLLMCaller: createPiLLMCaller });
 }

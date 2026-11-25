@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, mock } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -15,33 +15,37 @@ import type { HarnessProposal, HarnessReportData, TimelineEvent } from "../exten
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import piHarness2Extension from "../extensions/index.js";
 
+import piHarness2PiExtension from "../extensions/pi.js";
 // ---------------------------------------------------------------------------
 // Test scaffolding
 // ---------------------------------------------------------------------------
 
 type EventHandler = (event: unknown, ctx?: unknown) => Promise<void> | void;
 
+interface MockCommand {
+  description: string;
+  getArgumentCompletions?: (prefix: string) => Array<{ value: string }> | null;
+  handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+}
+
 interface MockRuntime {
   events: Map<string, EventHandler>;
   fire(event: string, ctx: unknown, payload?: unknown): Promise<void>;
-  command(name: string): {
-    description: string;
-    handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
-  };
+  command(name: string): MockCommand;
 }
 
-function createMockPi(): MockRuntime {
+function createMockPi(registerExtension: (pi: ExtensionAPI) => void = piHarness2Extension): MockRuntime {
   const events = new Map<string, EventHandler>();
-  const commands = new Map<string, { description: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void }>();
+  const commands = new Map<string, MockCommand>();
   const mockPi = {
     on: (event: string, handler: unknown) => {
       events.set(event, handler as EventHandler);
     },
     registerCommand: (name: string, def: unknown) => {
-      commands.set(name, def as { description: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void });
+      commands.set(name, def as MockCommand);
     },
   } as unknown as ExtensionAPI;
-  piHarness2Extension(mockPi);
+  registerExtension(mockPi);
   return {
     events,
     fire: (event: string, ctx: unknown, payload?: unknown) => {
@@ -1230,6 +1234,377 @@ describe("pi-harness2 test suite", () => {
   // extension wiring (commands + events)
   // -------------------------------------------------------------------------
 
+  test("OMP auto switch finalization should use the outgoing snapshot when a newer clean same-cwd session exists", async () => {
+    const dir = path.join(tmpDir, "switch-snapshot-project");
+    fs.mkdirSync(path.join(dir, ".omp"), { recursive: true });
+
+    const rt = createMockPi();
+    const ctxOutgoing = createMockCtx(dir);
+    const ctxIncoming = createMockCtx(dir);
+    await rt.fire("session_start", ctxOutgoing);
+    await rt.command("harness-mode").handler("auto", ctxOutgoing as unknown as ExtensionCommandContext);
+
+    const outgoingSession = writeSessionFixture(
+      [toolError("snapshot-1", "failure one"), toolError("snapshot-2", "failure two")],
+      "a-outgoing-evidence",
+      dir,
+    );
+    await rt.fire("session_before_switch", ctxOutgoing, { reason: "new" });
+
+    const incomingSession = writeSessionFixture([], "z-incoming-clean", dir);
+    expect(findSessionFile(detectHost(dir), dir)).toBe(incomingSession);
+
+    await rt.fire("session_switch", ctxIncoming, { previousSessionFile: outgoingSession });
+
+    expect(fs.existsSync(path.join(dir, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(true);
+    const entries = new ImprovementLedger(detectHost(dir)).getEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.evidence).toEqual({ tool: "bash", baselineErrorCount: 2 });
+  });
+
+  test("OMP switch should finalize the captured outgoing session only after a successful switch", async () => {
+    const dirA = path.join(tmpDir, "switch-project-a");
+    const dirB = path.join(tmpDir, "switch-project-b");
+    fs.mkdirSync(path.join(dirA, ".omp"), { recursive: true });
+    fs.mkdirSync(path.join(dirB, ".omp"), { recursive: true });
+
+    const rt = createMockPi();
+    const ctxA = createMockCtx(dirA);
+    const ctxB = createMockCtx(dirB);
+    await rt.fire("session_start", ctxA);
+    await rt.command("harness-mode").handler("auto", ctxA as unknown as ExtensionCommandContext);
+
+    const outgoingSession = writeSessionFixture(
+      [toolError("switch-1", "failure one"), toolError("switch-2", "failure two")],
+      "switch-outgoing",
+      dirA,
+    );
+    await rt.fire("session_before_switch", ctxA, { reason: "new" });
+    expect(fs.existsSync(path.join(dirA, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(false);
+
+    await rt.fire("session_switch", ctxB, { previousSessionFile: outgoingSession });
+
+    expect(fs.existsSync(path.join(dirA, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(true);
+    expect(fs.existsSync(path.join(dirB, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(false);
+    expect(new ImprovementLedger(detectHost(dirA)).getEntries()).toHaveLength(1);
+  });
+
+  test("OMP switch should clear pending proposals and refresh project mode and cwd", async () => {
+    const dirA = path.join(tmpDir, "state-project-a");
+    const dirB = path.join(tmpDir, "state-project-b");
+    fs.mkdirSync(path.join(dirA, ".omp"), { recursive: true });
+    fs.mkdirSync(path.join(dirB, ".omp", "harness"), { recursive: true });
+    fs.writeFileSync(path.join(dirB, ".omp", "harness", "settings.json"), JSON.stringify({ mode: "review" }));
+
+    const rt = createMockPi();
+    const notificationsA: string[] = [];
+    const notificationsB: string[] = [];
+    const ctxA = createMockCtx(dirA, notificationsA);
+    const ctxB = createMockCtx(dirB, notificationsB);
+    await rt.fire("session_start", ctxA);
+    writeSessionFixture(
+      [toolError("state-1", "failure one"), toolError("state-2", "failure two")],
+      "state-outgoing",
+      dirA,
+    );
+    await rt.fire("agent_end", ctxA);
+    expect(notificationsA.some((message) => message.includes("harness improvement proposals available"))).toBe(true);
+    await rt.command("harness-mode").handler("auto", ctxA as unknown as ExtensionCommandContext);
+
+    const rollbackTarget = path.join(dirB, ".omp", "skills", "rollback-probe", "SKILL.md");
+    fs.mkdirSync(path.dirname(rollbackTarget), { recursive: true });
+    fs.writeFileSync(rollbackTarget, "# Rollback probe\n");
+    const rollbackProposal = baseProposal({
+      id: "switch-state-rollback",
+      component: "c6_skill",
+      targetPath: rollbackTarget,
+      summary: "Rollback completion probe",
+      contentDelta: "# Rollback probe\n",
+    });
+    const rollbackEntry = new ImprovementLedger(detectHost(dirB)).recordCommit(rollbackProposal, "switch-state");
+
+    await rt.fire("session_before_switch", ctxA, { reason: "new" });
+    await rt.fire("session_switch", ctxB, { previousSessionFile: "outgoing-session.jsonl" });
+
+    await rt.command("harness-mode").handler("", ctxB as unknown as ExtensionCommandContext);
+    expect(notificationsB.some((message) => message.includes("Current mode: review"))).toBe(true);
+
+    await rt.command("harness-reflect").handler("", ctxB as unknown as ExtensionCommandContext);
+    expect(notificationsB.some((message) => message.includes("No friction diagnosed"))).toBe(true);
+
+    const rollbackCompletions = rt.command("harness-rollback").getArgumentCompletions?.(rollbackEntry.id);
+    expect(rollbackCompletions?.map((completion) => completion.value)).toContain(rollbackEntry.id);
+  });
+
+  test("OMP process-exit session_shutdown should not run LLM-backed evolution", async () => {
+    let llmCalls = 0;
+    mock.module("@oh-my-pi/pi-ai", () => ({
+      completeSimple: async () => {
+        llmCalls++;
+        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ proposals: [] }) }] };
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+      const rt = createMockPi();
+      const ctx = { ...createMockCtx(tmpDir), model: {} };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture([{ role: "user", content: [{ type: "text", text: "Please explain this workflow." }] }], "shutdown-llm");
+
+      await rt.fire("session_shutdown", ctx, { reason: "quit" });
+
+      expect(llmCalls).toBe(0);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("OMP session_before_shutdown should run LLM-backed evolution", async () => {
+    let llmCalls = 0;
+    mock.module("@oh-my-pi/pi-ai", () => ({
+      completeSimple: async () => {
+        llmCalls++;
+        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ proposals: [] }) }] };
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+      const rt = createMockPi();
+      const ctx = { ...createMockCtx(tmpDir), model: {} };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture([{ role: "user", content: [{ type: "text", text: "Please explain this workflow." }] }], "before-shutdown-llm");
+
+      await rt.fire("session_before_shutdown", ctx, { reason: "quit" });
+
+      expect(llmCalls).toBe(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("OMP session_before_shutdown should forward its close signal and ignore late proposals", async () => {
+    type Completion = {
+      stopReason: "stop";
+      content: Array<{ type: "text"; text: string }>;
+    };
+    const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<Completion>();
+    const { promise: completionStarted, resolve: markCompletionStarted } = Promise.withResolvers<void>();
+    let completionSignal: AbortSignal | undefined;
+    mock.module("@oh-my-pi/pi-ai", () => ({
+      completeSimple: (_model: unknown, options: { signal?: AbortSignal }) => {
+        completionSignal = options.signal;
+        markCompletionStarted();
+        return completion;
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+      const rt = createMockPi();
+      const ctx = { ...createMockCtx(tmpDir), model: {} };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture(
+        [
+          { role: "user", content: [{ type: "text", text: "Please explain this workflow." }] },
+          toolError("shutdown-1", "failure one"),
+          toolError("shutdown-2", "failure two"),
+        ],
+        "shutdown-abort-late-proposal",
+      );
+
+      const closeController = new AbortController();
+      const shutdown = rt.fire("session_before_shutdown", ctx, { signal: closeController.signal });
+      await Promise.race([completionStarted, shutdown]);
+      expect(completionSignal).toBe(closeController.signal);
+
+      closeController.abort();
+      resolveCompletion({
+        stopReason: "stop",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              proposals: [
+                {
+                  component: "c7_script",
+                  summary: "Create a late shutdown probe script",
+                  targetFile: "late-shutdown-probe.sh",
+                  contentDelta: "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' 'late proposal'\n",
+                  confidence: 0.9,
+                },
+              ],
+            }),
+          },
+        ],
+      });
+      await shutdown;
+
+      expect(fs.existsSync(path.join(tmpDir, ".omp", "scripts", "late-shutdown-probe.sh"))).toBe(false);
+      expect(new ImprovementLedger(detectHost(tmpDir)).getEntries()).toHaveLength(0);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("OMP session_shutdown should run deterministic fallback if close aborts after pre-shutdown", async () => {
+    let llmCalls = 0;
+    mock.module("@oh-my-pi/pi-ai", () => ({
+      completeSimple: async () => {
+        llmCalls++;
+        return {
+          stopReason: "stop",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                proposals: [
+                  {
+                    component: "c7_script",
+                    summary: "Create a pre-shutdown marker script",
+                    targetFile: "pre-shutdown-marker.sh",
+                    contentDelta: "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' 'pre-shutdown'\n",
+                    confidence: 0.9,
+                  },
+                ],
+              }),
+            },
+          ],
+        };
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+      const rt = createMockPi();
+      const ctx = { ...createMockCtx(tmpDir), model: {} };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture(
+        [
+          { role: "user", content: [{ type: "text", text: "Please explain this workflow." }] },
+          toolError("shutdown-1", "failure one"),
+          toolError("shutdown-2", "failure two"),
+        ],
+        "shutdown-abort-after-finalization",
+      );
+
+      const closeController = new AbortController();
+      await rt.fire("session_before_shutdown", ctx, { signal: closeController.signal });
+      const ledger = new ImprovementLedger(detectHost(tmpDir));
+      expect(llmCalls).toBe(1);
+      expect(ledger.getEntries()).toHaveLength(1);
+      expect(ledger.getEntries()[0]?.component).toBe("c7_script");
+
+      closeController.abort();
+      await rt.fire("session_shutdown", ctx, { reason: "quit" });
+
+      const entriesAfterFallback = new ImprovementLedger(detectHost(tmpDir)).getEntries();
+      expect(llmCalls).toBe(1);
+      expect(entriesAfterFallback.some((entry) => entry.component === "c6_skill")).toBe(true);
+      expect(fs.existsSync(path.join(tmpDir, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+
+  test("OMP auto evolution should not duplicate proposals across shutdown events", async () => {
+    let llmCalls = 0;
+    mock.module("@oh-my-pi/pi-ai", () => ({
+      completeSimple: async () => {
+        llmCalls++;
+        return {
+          stopReason: "stop",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                proposals: [
+                  {
+                    component: "c7_script",
+                    summary: "Create a safe pre-shutdown probe script",
+                    targetFile: "pre-shutdown-probe.sh",
+                    contentDelta: "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' 'pre-shutdown proposal'\n",
+                    confidence: 0.9,
+                  },
+                ],
+              }),
+            },
+          ],
+        };
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+      const rt = createMockPi();
+      const ctx = { ...createMockCtx(tmpDir), model: {} };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture(
+        [
+          { role: "user", content: [{ type: "text", text: "Please explain this workflow." }] },
+          toolError("shutdown-1", "failure one"),
+          toolError("shutdown-2", "failure two"),
+        ],
+        "shutdown-double-evolution",
+      );
+
+      await rt.fire("session_before_shutdown", ctx, { reason: "quit" });
+      await rt.fire("session_shutdown", ctx, { reason: "quit" });
+
+      const entries = new ImprovementLedger(detectHost(tmpDir)).getEntries();
+      expect(llmCalls).toBe(1);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.component).toBe("c7_script");
+      expect(entries[0]?.filePath).toBe(path.join(tmpDir, ".omp", "scripts", "pre-shutdown-probe.sh"));
+      expect(fs.existsSync(path.join(tmpDir, ".omp", "skills", "bash-best-practices", "SKILL.md"))).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+
+  test("Pi auto mode should run LLM-backed evolution at session_shutdown", async () => {
+    let llmCalls = 0;
+    mock.module("@earendil-works/pi-ai/compat", () => ({
+      completeSimple: async () => {
+        llmCalls++;
+        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ proposals: [] }) }] };
+      },
+    }));
+
+    try {
+      fs.mkdirSync(path.join(tmpDir, ".pi"), { recursive: true });
+      const rt = createMockPi(piHarness2PiExtension as unknown as (pi: ExtensionAPI) => void);
+      const ctx = { ...createMockCtx(tmpDir), model: { id: "test-model" } };
+      await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
+      writeSessionFixture(
+        [{ role: "user", content: [{ type: "text", text: "Please explain this workflow." }] }],
+        "pi-shutdown-llm",
+      );
+
+      await rt.fire("session_shutdown", ctx, { reason: "quit" });
+
+      expect(llmCalls).toBe(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Pi adapter should surface review proposals through agent_settled", async () => {
+    fs.mkdirSync(path.join(tmpDir, ".pi"), { recursive: true });
+    const rt = createMockPi(piHarness2PiExtension as unknown as (pi: ExtensionAPI) => void);
+    const notifications: string[] = [];
+    const ctx = createMockCtx(tmpDir, notifications);
+
+    await rt.fire("session_start", ctx);
+    writeSessionFixture([toolError("pi-f1", "failure one"), toolError("pi-f2", "failure two")], "pi-agent-settled");
+    await rt.fire("agent_settled", ctx);
+
+    expect(notifications.some((message) => message.includes("harness improvement proposals available"))).toBe(true);
+  });
+
   test("agent_end should surface review proposals and turn_start should re-arm diagnosis", async () => {
     fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
     const rt = createMockPi();
@@ -1513,7 +1888,11 @@ describe("pi-harness2 test suite", () => {
     fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
     const rt = createMockPi();
     const notifications: string[] = [];
+    let waitForIdleCalls = 0;
     const ctx = createMockCtx(tmpDir, notifications);
+    ctx.waitForIdle = async () => {
+      waitForIdleCalls++;
+    };
     await rt.command("harness-mode").handler("auto", ctx as unknown as ExtensionCommandContext);
 
     const bashErrors = (n: number, tag: string, days: number) =>
@@ -1547,6 +1926,8 @@ describe("pi-harness2 test suite", () => {
     const afterS4 = ledger.getEntries()[0]!;
     expect(afterS4.status).toBe("REVERTED");
     expect(notifications.some((n) => n.includes("Auto-rolled back"))).toBe(true);
+    // Shutdown without a reason uses the fallback path; rollback must not await reload/idle.
+    expect({ reloadCount: ctx.reloadCount, waitForIdleCalls }).toEqual({ reloadCount: 0, waitForIdleCalls: 0 });
     // The skill and its trigger are gone
     expect(fs.existsSync(path.join(tmpDir, ".omp", "skills", "bash-best-practices"))).toBe(false);
     expect(fs.readFileSync(new SurfaceManager(detectHost(tmpDir)).getRulesFile(), "utf-8")).not.toContain("bash-best-practices");
