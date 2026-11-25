@@ -12,7 +12,7 @@ import { ExperienceReflector, isGroundedInText, sanitizeErrorSnippet, isUserCorr
 import { ExperienceLibrary } from "../extensions/experience.js";
 import { HarnessReporter } from "../extensions/reporter.js";
 import type { HarnessProposal, HarnessReportData, TimelineEvent } from "../extensions/types.js";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import piHarness2Extension from "../extensions/index.js";
 
 // ---------------------------------------------------------------------------
@@ -1230,7 +1230,7 @@ describe("pi-harness2 test suite", () => {
   // extension wiring (commands + events)
   // -------------------------------------------------------------------------
 
-  test("agent_settled should surface review proposals and turn_start should re-arm diagnosis", async () => {
+  test("agent_end should surface review proposals and turn_start should re-arm diagnosis", async () => {
     fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
     const rt = createMockPi();
     const notifications: string[] = [];
@@ -1240,13 +1240,13 @@ describe("pi-harness2 test suite", () => {
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
 
     // Cycle 1 settles: diagnosis notifies (session_start banner was notification 1)
-    await rt.fire("agent_settled", ctx);
+    await rt.fire("agent_end", ctx);
     expect(notifications.some((n) => n.includes("harness improvement proposals available"))).toBe(true);
 
     // Cycle 2: turn_start re-arms, but deduplication prevents another notify
     await rt.fire("turn_start", ctx);
     const countAfterSettle = notifications.length;
-    await rt.fire("agent_settled", ctx);
+    await rt.fire("agent_end", ctx);
     expect(notifications.length).toBe(countAfterSettle);
   });
 
@@ -1256,7 +1256,7 @@ describe("pi-harness2 test suite", () => {
     const ctx = createMockCtx(tmpDir);
 
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
-    await rt.fire("agent_settled", ctx);
+    await rt.fire("agent_end", ctx);
 
     await rt.command("harness-apply").handler("all", ctx as unknown as ExtensionCommandContext);
     expect(ctx.reloadCount).toBe(1);
@@ -1276,7 +1276,7 @@ describe("pi-harness2 test suite", () => {
     fs.writeFileSync(rulesFile, `<!-- pi-harness2:rules:start -->\n${lines200}\n<!-- pi-harness2:rules:end -->\n`, "utf-8");
 
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
-    await rt.fire("agent_settled", ctx);
+    await rt.fire("agent_end", ctx);
 
     await rt.command("harness-apply").handler("all", ctx as unknown as ExtensionCommandContext);
 
@@ -1378,7 +1378,7 @@ describe("pi-harness2 test suite", () => {
 
     await rt.fire("session_start", ctxA);
     writeSessionFixture([toolError("fail-tool", "error 1"), toolError("fail-tool", "error 2")], "s-a", dirA);
-    await rt.fire("agent_settled", ctxA);
+    await rt.fire("agent_end", ctxA);
 
     await rt.command("harness-reflect").handler("", ctxA as unknown as ExtensionCommandContext);
     expect(notificationsA.some((n) => n.includes("bash-best-practices"))).toBe(true);
@@ -1621,7 +1621,7 @@ describe("pi-harness2 test suite", () => {
       { role: "user", content: [{ type: "text", text: "不对，必须使用 requiresNewTemplate 小事务隔离" }] },
     ];
     writeSessionFixture(correctionSession, "w-s1", tmpDir, tsInDays(40));
-    await rt.fire("agent_settled", ctx);
+    await rt.fire("agent_end", ctx);
     await rt.command("harness-apply").handler("all", ctx as unknown as ExtensionCommandContext);
 
     const ledger = new ImprovementLedger(detectHost(tmpDir));
