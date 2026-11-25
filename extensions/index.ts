@@ -3,7 +3,10 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
+// OMP 19 refuses to load an extension that imports @earendil-works/pi-tui, even
+// type-only. Only the autocomplete row shape was used here, so it is declared
+// locally instead.
+type AutocompleteItem = { value: string; label: string; description?: string };
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { detectHost, getHarnessPaths } from "./host-detector.js";
